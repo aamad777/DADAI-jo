@@ -10,7 +10,7 @@ from drawing import generate_drawing_with_stability
 from sound import play_animal_sound
 from dashboard import render_dashboard_tab
 from learn import render_learning_book_tab
-from kid_feedback import send_email_to_DAD AI
+from kid_feedback import send_email_to_dad
 from quiz_game import get_quiz_question
 from quiz_sounds import play_correct_sound, play_wrong_sound, play_win_sound
 from quiz_scoreboard import log_score, show_scoreboard
@@ -43,14 +43,14 @@ def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
 # ---------------------------------------------------------------------
 
 # Page config
-st.set_page_config(page_title="Ask DAD AI", layout="wide")
+st.set_page_config(page_title="Ask Dad AI", layout="wide")
 
 # Sidebar navigation
-st.sidebar.title("📚 DAD AI Navigation")
+st.sidebar.title("📚Dad AI Navigation")
 tab = st.sidebar.radio("Choose a tab:", [
-    "💬 Ask DAD AI",
+    "💬 Ask Dad AI",
     "🐾 Animal Fun",
-    "🛠️ DAD AI's Dashboard",
+    "🛠️ Dad's Dashboard",
     "📚 Learning Book",
     "🧠 Quiz Fun",
     "📊 Scoreboard",
@@ -115,8 +115,8 @@ def ask_predefined_or_model(question):
 # =============== TABS ===============
 
 # 💬 Ask
-if tab == "💬 Ask DAD AI":
-    st.title("👨‍👧 Ask DAD AI")
+if tab == "💬 Ask Dad AI":
+    st.title("👨‍👧 Ask Dad AI")
 
     name = st.text_input("🙋 What's your name?", key="child_name")
     question = st.text_input("❓ What do you want to ask?", key="child_question")
@@ -164,9 +164,9 @@ if tab == "💬 Ask DAD AI":
                 st.info("Awesome! You can try the Quiz Fun tab to practice 🍎")
 
         with c_no:
-            if st.button("✉️ Email DAD AI (I don't understand)", key="btn_understand_no"):
-                with st.spinner("Sending email to DAD AI..."):
-                    ok, msg = send_email_to_DAD AI(
+            if st.button("✉️ Email Dad (I don't understand)", key="btn_understand_no"):
+                with st.spinner("Sending email to Dad..."):
+                    ok, msg = send_email_to_dad(
                         child_name=kid,
                         question=question_saved,
                         answer=answer,
@@ -178,7 +178,7 @@ if tab == "💬 Ask DAD AI":
         if "email_status" in st.session_state:
             ok, msg = st.session_state["email_status"]
             if ok:
-                st.success("Email sent to DAD AI ✅")
+                st.success("Email sent to Dad ✅")
                 st.caption(msg)
             else:
                 st.error("Couldn't send email ❌")
@@ -207,14 +207,14 @@ elif tab == "🐾 Animal Fun":
             else:
                 st.warning("Couldn't generate drawing (check STABILITY_API_KEY in your .env).")
 
-# 🛠️ DAD AI's Dashboard
-elif tab == "🛠️ DAD AI's Dashboard":
-    st.title("🛠️ DAD AI's Dashboard")
+# 🛠️ Dad AI's Dashboard
+elif tab == "🛠️ Dad's Dashboard":
+    st.title("🛠️ Dad AI's Dashboard")
 
     # Optional quick test for email config
-    if st.button("📧 Send Test Email to DAD AI"):
+    if st.button("📧 Send Test Email to Dad"):
         with st.spinner("Sending test email..."):
-            ok, msg = send_email_to_DAD AI("Test Kid", "This is a test email.", "This is a test answer.")
+            ok, msg = send_email_to_dad("Test Kid", "This is a test email.", "This is a test answer.")
         if ok:
             st.success("Test email sent ✅")
             st.caption(msg)
