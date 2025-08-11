@@ -1,0 +1,83 @@
+# === New Tab: Draw & Guess (Gemini) ===
+with st.sidebar:
+    st.markdown("""
+    ### ✨ New: Draw & Guess (Gemini)
+    Let your kid draw, then Gemini will guess the animal and show a real photo!
+    """)
+
+try:
+    from streamlit_drawable_canvas import st_canvas
+    from gemini_ai import classify_sketch, fetch_animal_photo
+    CANVAS_OK = True
+except Exception as _e:
+    CANVAS_OK = False
+
+if 'Draw & Guess (Gemini)' in tab_names:
+    pass
+else:
+    tab_names.append('Draw & Guess (Gemini)')
+
+# Rebuild tabs to include the new one (simple approach for patch)
+tab = st.sidebar.radio("Go to", tab_names, index=0)
+
+if tab == 'Draw & Guess (Gemini)':
+    st.title("🎨 Draw & Guess (Gemini)")
+    st.write("Draw any animal and let AI guess it! Then see a real photo.")
+
+    if not CANVAS_OK:
+        st.warning("Install dependencies first: pip install streamlit-drawable-canvas google-generativeai pillow" )
+    else:
+        stroke_w = st.slider("Pen size", 4, 30, 12)
+        bg = st.color_picker("Background", "#FFFFFF")
+        st.write("Tip: use black pen on white background for best results.")
+
+        canvas_result = st_canvas(
+            fill_color="rgba(0, 0, 0, 0)",
+            stroke_width=stroke_w,
+            stroke_color="#000000",
+            background_color=bg,
+            update_streamlit=True,
+            height=300,
+            width=300,
+            drawing_mode="freedraw",
+            key="canvas",
+        )
+
+        col1, col2 = st.columns(2)
+        guess = None
+        if col1.button("🤖 Guess with Gemini"):
+            if canvas_result.image_data is not None:
+                from PIL import Image
+                import numpy as np
+                import io
+
+                # Convert canvas (RGBA numpy array) to PNG bytes
+                img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
+                # Make a high-contrast version to help recognition
+                img = img.convert("L").point(lambda x: 0 if x < 250 else 255).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+
+                with st.spinner("Asking Gemini..."):
+                    try:
+                        guess = classify_sketch(png_bytes)
+                    except Exception as e:
+                        st.error(f"Gemini error: {e}")
+                        guess = None
+
+            else:
+                st.info("Please draw something first.")
+
+        if guess:
+            st.success(f"I think it's a **{guess.get('animal','unknown')}** (certainty {guess.get('certainty',0):.2f})")
+            if guess.get("alternatives"):
+                st.caption("Other ideas: " + ", ".join(guess["alternatives"]))
+
+            if col2.button("📷 Show real photo"):
+                with st.spinner("Finding a photo..."):
+                    url = fetch_animal_photo(guess.get("animal",""))
+                if url:
+                    st.image(url, caption=f"Real photo of a {guess.get('animal','')}", use_column_width=True)
+                else:
+                    st.warning("Couldn't find a photo right now. Try another animal or check your internet.")

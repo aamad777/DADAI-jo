@@ -1,0 +1,16 @@
+streamlit
+requests
+openai
+python-dotenv
+PyMuPDF
+google-generativeai
+Pillow
+streamlit-drawable-canvas
+gTTS
+# Add these to your requirements.txt if missing
+google-generativeai
+Pillow
+streamlit-drawable-canvas
+gTTS
+SpeechRecognition
+streamlit-mic-recorder

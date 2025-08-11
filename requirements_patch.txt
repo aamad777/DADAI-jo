@@ -1,0 +1,7 @@
+# Add these to your requirements.txt if missing
+google-generativeai
+Pillow
+streamlit-drawable-canvas
+gTTS
+SpeechRecognition
+streamlit-mic-recorder
