@@ -1,3 +1,4 @@
+# app.py
 import os, json, threading, queue, random, html
 from datetime import datetime
 from io import BytesIO
@@ -5,6 +6,13 @@ from io import BytesIO
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# ---- Optional mic widget (graceful fallback if not installed) ----
+try:
+    from audio_recorder_streamlit import audio_recorder  # pip install audio-recorder-streamlit
+    HAS_AUDIO_RECORDER = True
+except Exception:
+    HAS_AUDIO_RECORDER = False
 
 # ---- Project modules already in your repo ----
 from drawing import generate_drawing_with_stability
@@ -17,8 +25,7 @@ from quiz_sounds import play_correct_sound, play_wrong_sound, play_win_sound
 from quiz_scoreboard import log_score, show_scoreboard
 from streamlit_drawable_canvas import st_canvas
 from gemini_ai import classify_sketch, fetch_animal_photo, ask_gemini
-from audio_recorder_streamlit import audio_recorder
-# ---------------------------------------------
+# ---------------------------------------------------------------
 
 load_dotenv()
 
@@ -26,7 +33,7 @@ load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
-# ===== TTS (gTTS) =====
+# ===== TTS (gTTS) ==============================================================
 def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
     if not text:
         return b""
@@ -38,7 +45,7 @@ def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
     gTTS(text=text, lang=lang, slow=slow).write_to_fp(mp3_fp)
     return mp3_fp.getvalue()
 
-# ===== STT (Whisper if available; else Google with timeout) =====
+# ===== STT (Whisper if available; else Google with timeout) ====================
 STT_TIMEOUT_SECS = 10
 
 def _google_stt_worker(audio_bytes: bytes, out_q: "queue.Queue[tuple[str|None, str|None]]"):
@@ -81,14 +88,11 @@ def transcribe_audio(audio_bytes: bytes):
     except queue.Empty:
         return None, "STT failed unexpectedly (no result)."
 
-# ===== Styling & Animations (no images needed) =====
+# ===== Styling & Animations (no images needed) =================================
 st.set_page_config(page_title="Ask DAD AI", layout="wide")
 st.markdown("""
 <style>
-/* global */
 body { overflow-x: hidden; }
-
-/* Fun, modern buttons */
 .kids-ui .stButton>button,
 .kids-ui [data-testid="stButton"]>button {
   font-size: 22px !important; font-weight: 800 !important; min-height: 56px !important;
@@ -156,7 +160,7 @@ body { overflow-x: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
-# ===== Sidebar =====
+# ===== Sidebar =================================================================
 st.sidebar.title("📚 DAD AI Navigation")
 tab = st.sidebar.radio("Choose a tab:", [
     "💬 Ask DAD AI",
@@ -168,7 +172,7 @@ tab = st.sidebar.radio("Choose a tab:", [
     "🎨 Draw & Guess (Gemini)"
 ])
 
-# ===== Data helpers =====
+# ===== Data helpers =============================================================
 def load_answers():
     try:
         with open("answers.json","r",encoding="utf-8") as f:
@@ -213,7 +217,24 @@ def ask_predefined_or_model(question):
                 return f"Sorry, I couldn't answer right now: Gemini error: {gem_e}; OpenAI error: {openai_e}"
         return f"Sorry, I couldn't answer right now: {gem_e}"
 
-# ===== Name bubbles (animated) =====
+# ===== Audio input (mic if available, else upload WAV) =========================
+def audio_input_ui():
+    """Return (audio_bytes | None, source_str)."""
+    if HAS_AUDIO_RECORDER:
+        st.caption("🎙️ Record your question")
+        try:
+            audio_bytes = audio_recorder(pause_threshold=1.0, sample_rate=16000, text="Tap to record / stop")
+        except Exception:
+            audio_bytes = None
+        return audio_bytes, "recorder"
+    else:
+        st.caption("📁 Upload a short WAV clip (mic not available on this server)")
+        file = st.file_uploader("Choose a .wav file", type=["wav"], accept_multiple_files=False, label_visibility="collapsed")
+        if file:
+            return file.read(), "upload"
+        return None, "upload"
+
+# ===== Name bubbles (animated) =================================================
 BUBBLE_COLORS = [
     ("#a7f3d0", "#86efac"),
     ("#93c5fd", "#bfdbfe"),
@@ -234,7 +255,7 @@ def bubble_name_html(name: str) -> str:
         spans.append(f"<span class='bubble' style='--c1:{c1};--c2:{c2};--d:{delay}'>{safe}</span>")
     return "<div class='name-bubbles'>" + "".join(spans) + "</div>"
 
-# ===== Simple onboarding: name -> age -> ask =====
+# ===== Simple onboarding: name -> age -> ask ==================================
 def _sync_name_from_input():
     st.session_state["kid_name"] = st.session_state.get("kid_name_input", "")
 
@@ -255,7 +276,6 @@ def name_step():
     cols = st.columns([1,1,2])
     if cols[0].button("👋 I'm ready!"):
         st.session_state["child_name"] = name or "Kid"
-        # mini show: balloons + “Hi NAME” headline
         st.balloons()
         st.session_state["onboarding_step"] = "age"
         st.rerun()
@@ -270,21 +290,17 @@ def age_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
     st.subheader("🎂 How old are you?")
     st.caption("Tap one")
-    st.markdown("<div class='age-grid'>", unsafe_allow_html=True)
-    # Draw 1..10 as circles (we'll capture clicks with JS-free hack via st.button rows)
     row = st.columns(10)
     picked = None
     for i, n in enumerate(range(1,11)):
         with row[i]:
             if st.button(str(n), key=f"age_{n}"):
                 picked = n
-    st.markdown("</div>", unsafe_allow_html=True)
     if picked is not None:
         st.session_state["kid_age"] = picked
         st.session_state["onboarding_step"] = "ask"
         st.rerun()
 
-    # fun “Hi NAME” banner
     name = st.session_state.get("child_name","Kid")
     st.markdown(f"<div class='wave'>Hi, {html.escape(name)}!</div>", unsafe_allow_html=True)
     st.markdown(bubble_name_html(name), unsafe_allow_html=True)
@@ -295,17 +311,15 @@ def ask_step():
     name = st.session_state.get("child_name","Kid")
     age = st.session_state.get("kid_age")
 
-    # One-time yay when an answer just arrived
     if st.session_state.pop("just_answered", False):
         st.balloons()
         try:
-            play_win_sound()  # if available in your repo
+            play_win_sound()
         except Exception:
             pass
 
     st.markdown(f"### 👋 Hello, **{name}**" + (f" — age {age}" if age else ""))
 
-    # Quick idea chips (tap to fill)
     st.markdown("##### Try one of these:")
     ideas = [
         "Why is the sky blue?",
@@ -329,8 +343,8 @@ def ask_step():
     else:
         question = st.text_input("❓ What do you want to ask?", key="child_question")
 
-    st.caption("🎙️ Or record your question")
-    audio_bytes = audio_recorder(pause_threshold=1.0, sample_rate=16000, text="Tap to record / stop")
+    # Mic or upload (works even if audio_recorder_streamlit is missing)
+    audio_bytes, source = audio_input_ui()
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
         with st.spinner("Transcribing…"):
@@ -347,12 +361,12 @@ def ask_step():
     with c1:
         if st.button("✨ Get Answer", use_container_width=True):
             if not question.strip():
-                st.info("Please type a question or use the mic.")
+                st.info("Please type a question or use the mic/uploader.")
             else:
                 answer = ask_predefined_or_model(question.strip())
                 st.session_state["last_answer"] = answer
                 st.session_state["last_question"] = question.strip()
-                st.session_state["just_answered"] = True  # triggers balloons + sound
+                st.session_state["just_answered"] = True
                 st.rerun()
     with c2:
         if st.button("🔊 Read Aloud", use_container_width=True):
@@ -390,7 +404,7 @@ def ask_step():
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ========================= MAIN TABS =========================
+# ========================= MAIN TABS ===========================================
 if tab == "💬 Ask DAD AI":
     st.title("👨‍👧 Ask DAD AI")
     step = st.session_state.get("onboarding_step", "name")
