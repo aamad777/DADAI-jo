@@ -1,17 +1,19 @@
+# Core app dependencies
 streamlit
-requests
-openai
 python-dotenv
-PyMuPDF
-google-generativeai
+openai
 Pillow
+audio-recorder-streamlit
 streamlit-drawable-canvas
-gTTS
-# Add these to your requirements.txt if missing
 google-generativeai
-Pillow
-streamlit-drawable-canvas
-gTTS
-SpeechRecognition
-streamlit-mic-recorder
-audio-recorder-streamlit==0.0.8
+pdfminer.six
+requests
+
+# OCR and PDF tools
+pytesseract
+pdf2image
+pymupdf
+
+# (Optional but good for OCR on non-Latin languages)
+arabic-reshaper
+python-bidi
