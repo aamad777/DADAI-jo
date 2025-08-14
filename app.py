@@ -38,7 +38,7 @@ def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
     if not text:
         return b""
     try:
-        from gTTS import gTTS
+        from gtts import gTTS
     except ImportError as e:
         raise ImportError("gTTS is not installed. Run: pip install gTTS") from e
     mp3_fp = BytesIO()
@@ -288,25 +288,31 @@ def bubble_name_html(name: str) -> str:
     return "<div class='name-bubbles'>" + "".join(spans) + "</div>"
 
 # ===== Simple onboarding: name -> age -> ask ==================================
-def _sync_name_from_input():
-    st.session_state["kid_name"] = st.session_state.get("kid_name_input", "")
 
 def name_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
     st.subheader("🧩 What's your name?")
-    st.text_input(
-        "Type your name here:",
-        value=st.session_state.get("kid_name",""),
-        key="kid_name_input",
-        on_change=_sync_name_from_input
-    )
+
+    # --- Name input WITHOUT a widget key; we manage it manually to avoid key mutation errors
+    current_name = st.session_state.get("kid_name", "")
+    typed = st.text_input("Type your name here:", value=current_name)
+    if typed != current_name:
+        st.session_state["kid_name"] = typed
+
     name = (st.session_state.get("kid_name","") or "").strip()
+
     st.caption("Preview")
     st.markdown(bubble_name_html(name), unsafe_allow_html=True)
 
     cols = st.columns([1,1,2])
+
+    # Random name: set state BEFORE rendering next run (no widget key mutation)
+    if cols[1].button("🎲 Random name"):
+        demo = random.choice(["Maya","Omar","Lina","Adam","Sara","Ziad"])
+        st.session_state["kid_name"] = demo
+        st.rerun()
+
     if cols[0].button("👋 I'm ready!"):
-        # Save and trigger Name Fireworks: balloons + short TTS (“Hi, NAME!”)
         final_name = name or "Kid"
         st.session_state["child_name"] = final_name
         st.balloons()
@@ -319,11 +325,6 @@ def name_step():
         st.session_state["onboarding_step"] = "age"
         st.rerun()
 
-    if cols[1].button("🎲 Random name"):
-        demo = random.choice(["Maya","Omar","Lina","Adam","Sara","Ziad"])
-        st.session_state["kid_name"] = demo
-        st.session_state["kid_name_input"] = demo
-        st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
 def age_step():
@@ -338,7 +339,6 @@ def age_step():
                 picked = n
     if picked is not None:
         st.session_state["kid_age"] = picked
-        # prepare rotating compliments (index 0) to be shown on Ask step
         st.session_state["age_compliments_list"] = AGE_COMPLIMENTS_3.get(picked, ["🎈 Awesome age!"])
         st.session_state["age_comp_index"] = 0
         st.session_state["age_celebrate_msg"] = "age_ready"
@@ -453,7 +453,6 @@ def ask_step():
 
         comps = st.session_state.get("age_compliments_list", [])
         idx = st.session_state.get("age_comp_index", 0)
-        # pick 3 (rotate start index)
         if comps:
             rot = comps[idx:] + comps[:idx]
             show = rot[:3] if len(rot) >= 3 else rot
@@ -464,7 +463,7 @@ def ask_step():
             st.markdown("</div>", unsafe_allow_html=True)
             if st.button("🔄 Another compliment"):
                 st.session_state["age_comp_index"] = (idx + 1) % max(1, len(comps))
-                st.session_state["age_celebrate_msg"] = "age_ready"  # to re-render chips
+                st.session_state["age_celebrate_msg"] = "age_ready"
                 st.rerun()
 
     st.markdown(f"### 👋 Hello, **{name}**" + (f" — age {age}" if age else ""))
@@ -487,7 +486,6 @@ def ask_step():
             if st.button("🎯 More ideas"):
                 random.shuffle(CATEGORIES[category]["ideas"]); st.rerun()
         with c3:
-            # Magic Button — Surprise me: pick random category + idea, prefill question
             if st.button("✨ Surprise me"):
                 rand_cat = random.choice(list(CATEGORIES.keys()))
                 st.session_state["topic_category"] = rand_cat
@@ -500,9 +498,9 @@ def ask_step():
     default_q = st.session_state.pop("prefill_child_question", None)
     if default_q is not None:
         st.session_state.pop("child_question", None)
-        question = st.text_input("❓ What do you want to ask?", key="child_question", value=default_q)
+        question = st.text_input("❓ What do you want to ask?", value=default_q, key="ask_input")
     else:
-        question = st.text_input("❓ What do you want to ask?", key="child_question")
+        question = st.text_input("❓ What do you want to ask?", key="ask_input")
 
     audio_bytes, _ = audio_input_ui()
     if audio_bytes:
@@ -563,15 +561,15 @@ def ask_step():
         with tabs[0]:
             st.write(e3.get("picture",""))
             if st.button("🔁 Regenerate picture explain"):
-                st.session_state.pop("explain3", None); st.experimental_rerun()
+                st.session_state.pop("explain3", None); st.rerun()
         with tabs[1]:
             st.write(e3.get("story",""))
             if st.button("🔁 Regenerate story"):
-                st.session_state.pop("explain3", None); st.experimental_rerun()
+                st.session_state.pop("explain3", None); st.rerun()
         with tabs[2]:
             st.write(e3.get("steps",""))
             if st.button("🔁 Regenerate steps"):
-                st.session_state.pop("explain3", None); st.experimental_rerun()
+                st.session_state.pop("explain3", None); st.rerun()
 
         # === Understanding + Email Dad ========================================
         st.markdown("#### Did you understand it?")
