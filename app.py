@@ -1,4 +1,4 @@
-# app.py
+# app.py — Ask DAD AI (Classic + Neon UI + Name Fireworks + Compliment Cards + Magic Button + Explain 3 Ways)
 import os, json, threading, queue, random, html
 from datetime import datetime
 from io import BytesIO
@@ -25,27 +25,27 @@ from quiz_sounds import play_correct_sound, play_wrong_sound, play_win_sound
 from quiz_scoreboard import log_score, show_scoreboard
 from streamlit_drawable_canvas import st_canvas
 from gemini_ai import classify_sketch, fetch_animal_photo, ask_gemini
-# ---------------------------------------------------------------
 
+# ---------------------------------------------------------------
 load_dotenv()
 
 # Optional OpenAI (fallback + Whisper STT)
 openai_api_key = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
-# ===== TTS (gTTS) ==============================================================
+# ===== TTS (gTTS) =============================================================
 def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
     if not text:
         return b""
     try:
-        from gtts import gTTS
+        from gTTS import gTTS
     except ImportError as e:
         raise ImportError("gTTS is not installed. Run: pip install gTTS") from e
     mp3_fp = BytesIO()
     gTTS(text=text, lang=lang, slow=slow).write_to_fp(mp3_fp)
     return mp3_fp.getvalue()
 
-# ===== STT (Whisper if available; else Google with timeout) ====================
+# ===== STT (Whisper if available; else Google with timeout) ===================
 STT_TIMEOUT_SECS = 10
 
 def _google_stt_worker(audio_bytes: bytes, out_q: "queue.Queue[tuple[str|None, str|None]]"):
@@ -62,7 +62,7 @@ def _google_stt_worker(audio_bytes: bytes, out_q: "queue.Queue[tuple[str|None, s
         out_q.put((None, f"STT failed: {e}"))
 
 def transcribe_audio(audio_bytes: bytes):
-    # 1) Whisper if key available
+    # Whisper first
     if os.getenv("OPENAI_API_KEY"):
         try:
             import tempfile
@@ -76,7 +76,7 @@ def transcribe_audio(audio_bytes: bytes):
                 return text, None
         except Exception:
             pass
-    # 2) Google STT in thread with timeout
+    # Google in a thread with timeout
     out_q: "queue.Queue[tuple[str|None, str|None]]" = queue.Queue(maxsize=1)
     t = threading.Thread(target=_google_stt_worker, args=(audio_bytes, out_q), daemon=True)
     t.start(); t.join(STT_TIMEOUT_SECS)
@@ -88,13 +88,13 @@ def transcribe_audio(audio_bytes: bytes):
     except queue.Empty:
         return None, "STT failed unexpectedly (no result)."
 
-# ===== Styling & Animations (no images needed) =================================
+# ===== Styling & Animations ===================================================
 st.set_page_config(page_title="Ask DAD AI", layout="wide")
+
+# Global colorful button style for Classic mode + floating emoji css for compliments
 st.markdown("""
 <style>
-body { overflow-x: hidden; }
-.kids-ui .stButton>button,
-.kids-ui [data-testid="stButton"]>button {
+.kids-ui .stButton>button, .kids-ui [data-testid="stButton"]>button {
   font-size: 22px !important; font-weight: 800 !important; min-height: 56px !important;
   border-radius: 16px !important; border: none !important; color: #0f172a !important;
   box-shadow: 0 8px 16px rgba(0,0,0,0.08) !important; margin: 4px !important;
@@ -107,7 +107,7 @@ body { overflow-x: hidden; }
 .kids-ui [data-testid="stHorizontalBlock"] { gap: 6px !important; }
 .kids-ui [data-testid="column"] { padding-left: 2px !important; padding-right: 2px !important; }
 
-/* Animated name bubbles */
+/* Name bubbles */
 .name-bubbles { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px; }
 .bubble {
   display:inline-block; padding:.26rem .52rem; border-radius:12px;
@@ -120,7 +120,6 @@ body { overflow-x: hidden; }
 }
 @keyframes popIn { to { transform: translateY(0) scale(1); opacity:1; } }
 
-/* “Hi NAME” headline */
 .wave {
   font-size: 42px; font-weight: 900; letter-spacing: 1px; margin: 6px 0 4px 0;
   background: linear-gradient(90deg,#22c55e,#06b6d4,#a78bfa,#f97316);
@@ -129,43 +128,28 @@ body { overflow-x: hidden; }
 }
 @keyframes hue { 0%{filter:hue-rotate(0deg)} 100%{filter:hue-rotate(360deg)} }
 
-/* Age compliment toast */
-.age-toast {
-  margin: 6px 0 10px 0; padding: 12px 16px; border-radius: 14px; font-weight: 900;
-  background: linear-gradient(135deg,#d9f99d,#a7f3d0);
-  color:#0b1324; box-shadow: 0 10px 22px rgba(0,0,0,.08);
+/* Compliment chips + floating emoji */
+.compliment-row { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 2px 0; }
+.comp-chip {
+  display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px;
+  background:linear-gradient(135deg,#e9d5ff,#bfdbfe); color:#0b1324; font-weight:900;
+  box-shadow:0 8px 16px rgba(0,0,0,.08); border:1.5px solid rgba(255,255,255,.6);
 }
-
-/* Category cards */
-.cat-card { 
-  background: linear-gradient(135deg,var(--c1),var(--c2));
-  padding: 14px; border-radius: 16px; color:#0b1324; font-weight:900;
-  box-shadow:0 10px 22px rgba(0,0,0,.08); text-align:center;
+.float-emoji { position:relative; display:inline-block; }
+.float-emoji:before {
+  content: "🎉";
+  position:absolute; left:-6px; top:-10px; opacity:.85;
+  animation: floatUp 1.6s ease-in-out infinite;
 }
-.cat-emoji { font-size: 36px; line-height:1; }
-.cat-name { font-size: 18px; margin-top: 4px; }
-
-/* Answer card with sparkles */
-.pulse-card { position:relative; border-radius: 16px; padding: 12px 16px; background:#fff;
-  box-shadow: 0 10px 26px rgba(0,0,0,0.08); animation: pulse 1.2s ease-in-out 2; }
-@keyframes pulse { 0%{transform:scale(1)} 50%{transform:scale(1.02)} 100%{transform:scale(1)} }
-.pulse-card:after {
-  content:"✨"; position:absolute; right:12px; top:12px; font-size:22px; animation: sparkle 1.4s ease-in-out infinite;
+@keyframes floatUp {
+  0%{ transform: translateY(4px); opacity:.8}
+  50%{ transform: translateY(-4px); opacity:1}
+  100%{ transform: translateY(4px); opacity:.8}
 }
-@keyframes sparkle { 0%,100%{transform:rotate(0)} 50%{transform:rotate(12deg)} }
-
-/* Idea chips */
-.chips { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 4px; }
-.chip {
-  padding:6px 10px; border-radius:18px; background:#eef2ff; color:#1f2937; font-weight:700;
-  box-shadow:0 2px 4px rgba(0,0,0,.06); cursor:pointer; user-select:none; transition: transform .05s ease;
-  border:1px solid #e5e7eb;
-}
-.chip:hover { transform: translateY(-1px); }
 </style>
 """, unsafe_allow_html=True)
 
-# ===== Sidebar =================================================================
+# ===== Sidebar ================================================================
 st.sidebar.title("📚 DAD AI Navigation")
 tab = st.sidebar.radio("Choose a tab:", [
     "💬 Ask DAD AI",
@@ -177,7 +161,10 @@ tab = st.sidebar.radio("Choose a tab:", [
     "🎨 Draw & Guess (Gemini)"
 ])
 
-# ===== Data helpers =============================================================
+# Toggle UI style
+ui_style = st.sidebar.selectbox("🎨 UI style", ["Classic", "Neon"], index=0)
+
+# ===== Data helpers ===========================================================
 def load_answers():
     try:
         with open("answers.json","r",encoding="utf-8") as f:
@@ -199,99 +186,73 @@ def save_qa_log(name, question, answer):
     with open("qa_log.json","w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False,indent=2)
 
-# ===== Category catalog =========================================================
+# ===== Categories & compliments ==============================================
 CATEGORIES = {
-    "Math": {
-        "emoji": "➗", "colors": ("#fde68a", "#fca5a5"),
-        "ideas": ["What is zero?", "What is 7 + 3?", "Why are triangles special?"]
-    },
-    "Science": {
-        "emoji": "🔬", "colors": ("#bbf7d0", "#93c5fd"),
-        "ideas": ["Why is the sky blue?", "What is gravity?", "How do plants drink water?"]
-    },
-    "Space": {
-        "emoji": "🚀", "colors": ("#c7d2fe", "#93c5fd"),
-        "ideas": ["What is a black hole?", "Why do stars twinkle?", "How big is the Sun?"]
-    },
-    "History": {
-        "emoji": "🏛️", "colors": ("#fef3c7", "#fdba74"),
-        "ideas": ["Who built the pyramids?", "Who was the first pilot?", "What is a castle?"]
-    },
-    "Animals": {
-        "emoji": "🐼", "colors": ("#86efac", "#a7f3d0"),
-        "ideas": ["Why do cats purr?", "How do bees make honey?", "Do elephants swim?"]
-    },
-    "Geography": {
-        "emoji": "🗺️", "colors": ("#bae6fd", "#93c5fd"),
-        "ideas": ["Where does rain come from?", "What is a volcano?", "What is a desert?"]
-    },
-    "Art": {
-        "emoji": "🎨", "colors": ("#fbcfe8", "#fda4af"),
-        "ideas": ["What are primary colors?", "What is a portrait?", "How do you mix green?"]
-    },
-    "Sports": {
-        "emoji": "⚽", "colors": ("#d1fae5", "#a7f3d0"),
-        "ideas": ["How big is a soccer field?", "What is offside?", "Why do we warm up?"]
-    },
+    "Math": {"emoji": "➗", "colors": ("#fde68a", "#fca5a5"),
+             "ideas": ["What is zero?", "What is 7 + 3?", "Why are triangles special?"]},
+    "Science": {"emoji": "🔬", "colors": ("#bbf7d0", "#93c5fd"),
+                "ideas": ["Why is the sky blue?", "What is gravity?", "How do plants drink water?"]},
+    "Space": {"emoji": "🚀", "colors": ("#c7d2fe", "#93c5fd"),
+              "ideas": ["What is a black hole?", "Why do stars twinkle?", "How big is the Sun?"]},
+    "History": {"emoji": "🏛️", "colors": ("#fef3c7", "#fdba74"),
+                "ideas": ["Who built the pyramids?", "Who was the first pilot?", "What is a castle?"]},
+    "Animals": {"emoji": "🐼", "colors": ("#86efac", "#a7f3d0"),
+                "ideas": ["Why do cats purr?", "How do bees make honey?", "Do elephants swim?"]},
+    "Geography": {"emoji": "🗺️", "colors": ("#bae6fd", "#93c5fd"),
+                  "ideas": ["Where does rain come from?", "What is a volcano?", "What is a desert?"]},
+    "Art": {"emoji": "🎨", "colors": ("#fbcfe8", "#fda4af"),
+            "ideas": ["What are primary colors?", "What is a portrait?", "How do you mix green?"]},
+    "Sports": {"emoji": "⚽", "colors": ("#d1fae5", "#a7f3d0"),
+               "ideas": ["How big is a soccer field?", "What is offside?", "Why do we warm up?"]},
 }
 
-# ===== Age compliments ==========================================================
-AGE_COMPLIMENTS = {
-    1: "🎈 Wow, age 1! Tiny explorer mode unlocked!",
-    2: "🎈 Wonderful age for discovering shapes and sounds!",
-    3: "🎈 Super 3! Your questions are magic keys!",
-    4: "🎈 Fantastic 4! Brain power growing fast!",
-    5: "🎈 High-five 5! Ready to solve mysteries!",
-    6: "🎈 Super six! Science ninja in training!",
-    7: "🎈 Lucky 7! Space captain energy!",
-    8: "🎈 Great 8! Math hero level up!",
-    9: "🎈 Brilliant 9! Ideas are blasting off!",
-    10: "🎈 Terrific 10! Double-digits, double-awesome!",
+# Three rotating compliments per age (we'll cycle an index)
+AGE_COMPLIMENTS_3 = {
+    1: ["🎈 Tiny explorer mode unlocked!", "🧩 Look at you discovering sounds!", "🌟 Little star on the move!"],
+    2: ["🎈 Shape detective in action!", "🎶 Rhythm captain with claps!", "🧸 Cozy learner, big smiles!"],
+    3: ["🎈 Super 3! Questions = magic keys!", "🔍 Curiosity booster activated!", "🚀 Learning rocket ready!"],
+    4: ["🎈 Fantastic 4! Brain power zoom!", "🧠 Idea builder unlocked!", "🎨 Color master in training!"],
+    5: ["🎈 High‑five 5! Mystery solver!", "🦸 Brave thinker level 5!", "📚 Word wizard warming up!"],
+    6: ["🎈 Super six! Science ninja!", "⚙️ Tinkerer with bright ideas!", "🔬 Lab legend loading!"],
+    7: ["🎈 Lucky 7! Space captain energy!", "🛰️ Orbiting awesome ideas!", "🌌 Galaxy of questions!"],
+    8: ["🎈 Great 8! Math hero!", "🧩 Pattern pro unlocked!", "📏 Ruler of riddles!"],
+    9: ["🎈 Brilliant 9! Ideas blasting off!", "💡 Spark storm incoming!", "🏆 Champion of ‘why’!"],
+    10:["🎈 Terrific 10! Double‑awesome!", "🔥 Power‑up: expert learner!", "🎓 Junior scholar online!"],
 }
 
-# ===== Model wrapper: add category + age context ================================
+# ===== Model wrapper: add category + age context ==============================
 def ask_with_context(question: str, category: str | None, age: int | None) -> str:
-    """Route to Gemini (preferred) then OpenAI, adding kid-friendly context."""
-    # Quick canned answers first
     answers = load_answers()
     for k, v in answers.items():
         if k.lower() in question.lower():
             return v
-
-    # Build a friendly instruction prefix
     topic = category or "General"
     age_text = f"{age}" if age else "kid"
     instruction = (
         f"Please answer like a kind teacher for a child age {age_text}. "
         f"Topic: {topic}. Keep it short, clear, and fun. Use simple words."
     )
-
-    # Try Gemini module first
+    # Try Gemini first
     try:
         return ask_gemini(f"{instruction}\nQuestion: {question}")
-    except Exception as gem_e:
+    except Exception:
         pass
-
-    # Fallback to OpenAI if available
+    # Fallback OpenAI
     if client:
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role":"system","content":instruction},
-                    {"role":"user","content":question},
-                ],
+                messages=[{"role":"system","content":instruction},
+                          {"role":"user","content":question}],
                 temperature=0.4, max_tokens=180
             )
             return (resp.choices[0].message.content or "").strip()
-        except Exception as openai_e:
-            return f"Sorry, I couldn't answer right now: {openai_e}"
-
+        except Exception as e:
+            return f"Sorry, I couldn't answer right now: {e}"
     return "Sorry, I couldn't answer right now."
 
-# ===== Audio input (mic if available, else WAV upload) =========================
+# ===== Audio input (mic if available, else WAV upload) ========================
 def audio_input_ui():
-    """Return (audio_bytes | None, source_str)."""
     if HAS_AUDIO_RECORDER:
         st.caption("🎙️ Record your question")
         try:
@@ -306,7 +267,7 @@ def audio_input_ui():
             return file.read(), "upload"
         return None, "upload"
 
-# ===== Name bubbles (animated) =================================================
+# ===== Name bubbles (animated) ================================================
 BUBBLE_COLORS = [
     ("#a7f3d0", "#86efac"),
     ("#93c5fd", "#bfdbfe"),
@@ -315,7 +276,6 @@ BUBBLE_COLORS = [
     ("#c7d2fe", "#93c5fd"),
     ("#fdba74", "#fef3c7"),
 ]
-
 def bubble_name_html(name: str) -> str:
     if not name.strip():
         return "<div class='name-bubbles'> </div>"
@@ -341,16 +301,24 @@ def name_step():
         on_change=_sync_name_from_input
     )
     name = (st.session_state.get("kid_name","") or "").strip()
-
     st.caption("Preview")
     st.markdown(bubble_name_html(name), unsafe_allow_html=True)
 
     cols = st.columns([1,1,2])
     if cols[0].button("👋 I'm ready!"):
-        st.session_state["child_name"] = name or "Kid"
+        # Save and trigger Name Fireworks: balloons + short TTS (“Hi, NAME!”)
+        final_name = name or "Kid"
+        st.session_state["child_name"] = final_name
         st.balloons()
+        try:
+            st.session_state["name_greeting_bytes"] = tts_gtts_bytes(f"Hi, {final_name}!", lang="en")
+            st.session_state["play_name_greeting"] = True
+        except Exception:
+            st.session_state["name_greeting_bytes"] = b""
+            st.session_state["play_name_greeting"] = False
         st.session_state["onboarding_step"] = "age"
         st.rerun()
+
     if cols[1].button("🎲 Random name"):
         demo = random.choice(["Maya","Omar","Lina","Adam","Sara","Ziad"])
         st.session_state["kid_name"] = demo
@@ -370,14 +338,22 @@ def age_step():
                 picked = n
     if picked is not None:
         st.session_state["kid_age"] = picked
-        # store a one-time compliment to show on ask screen
-        st.session_state["age_celebrate_msg"] = AGE_COMPLIMENTS.get(picked, f"🎈 Awesome age: {picked}!")
+        # prepare rotating compliments (index 0) to be shown on Ask step
+        st.session_state["age_compliments_list"] = AGE_COMPLIMENTS_3.get(picked, ["🎈 Awesome age!"])
+        st.session_state["age_comp_index"] = 0
+        st.session_state["age_celebrate_msg"] = "age_ready"
         st.session_state["onboarding_step"] = "ask"
         st.rerun()
 
     name = st.session_state.get("child_name","Kid")
     st.markdown(f"<div class='wave'>Hi, {html.escape(name)}!</div>", unsafe_allow_html=True)
     st.markdown(bubble_name_html(name), unsafe_allow_html=True)
+
+    # Auto-play name greeting once upon arriving to age step
+    if st.session_state.pop("play_name_greeting", False):
+        audio_bytes = st.session_state.pop("name_greeting_bytes", b"")
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/mp3")
     st.markdown("</div>", unsafe_allow_html=True)
 
 def render_category_picker():
@@ -391,12 +367,12 @@ def render_category_picker():
             cfg = CATEGORIES[k]
             with cols[i]:
                 st.markdown(
-                    f"""
-                    <div class="cat-card" style="--c1:{cfg['colors'][0]};--c2:{cfg['colors'][1]}">
-                      <div class="cat-emoji">{cfg['emoji']}</div>
-                      <div class="cat-name">{k}</div>
-                    </div>
-                    """,
+                    f"<div style=\"background:linear-gradient(135deg,{cfg['colors'][0]},{cfg['colors'][1]});"
+                    f"padding:14px;border-radius:16px;color:#0b1324;font-weight:900;"
+                    f"box-shadow:0 10px 22px rgba(0,0,0,.08);text-align:center\">"
+                    f"<div style='font-size:36px'>{cfg['emoji']}</div>"
+                    f"<div style='font-size:18px;margin-top:4px'>{k}</div>"
+                    f"</div>",
                     unsafe_allow_html=True
                 )
                 if st.button(f"Choose {k}", key=f"choose_{k}", use_container_width=True):
@@ -405,8 +381,7 @@ def render_category_picker():
 
 def render_idea_chips(category: str):
     ideas = CATEGORIES.get(category, {}).get("ideas", [])
-    if not ideas:
-        return
+    if not ideas: return
     st.markdown("##### Try one of these:")
     chip_cols = st.columns(min(6, len(ideas)))
     for i, idea in enumerate(ideas):
@@ -415,50 +390,113 @@ def render_idea_chips(category: str):
                 st.session_state["child_question"] = idea
                 st.rerun()
 
+def _explain_three_ways(base_q: str, base_a: str, age: int | None, category: str | None):
+    """
+    Generate and cache Picture / Story / Steps variations for the current answer.
+    Stored in st.session_state['explain3'] = {'picture': str, 'story': str, 'steps': str}
+    """
+    if "explain3" in st.session_state and st.session_state.get("explain3_q") == base_q:
+        return st.session_state["explain3"]
+
+    age_text = f"{age}" if age else "kid"
+    topic = category or "General"
+
+    def _gen(prompt: str) -> str:
+        # Prefer Gemini
+        try:
+            return ask_gemini(prompt).strip()
+        except Exception:
+            pass
+        # Fallback OpenAI
+        if client:
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"user","content":prompt}],
+                    temperature=0.5, max_tokens=220
+                )
+                return (resp.choices[0].message.content or "").strip()
+            except Exception:
+                return ""
+        return ""
+
+    picture = _gen(
+        f"Explain with a visual description for a child age {age_text} about this topic ({topic}). "
+        f"Describe a simple picture (text-only, no image) that would help them understand this answer: {base_a}. "
+        f"Keep it to 2-3 cheerful sentences."
+    )
+    story = _gen(
+        f"Tell a short, cute story (<=80 words) for a child age {age_text} that teaches the idea in this answer: {base_a}. "
+        f"Use simple words and a friendly tone."
+    )
+    steps = _gen(
+        f"Explain in 3–5 simple steps for a child age {age_text}, from easiest to a little harder, "
+        f"to understand the idea behind this answer: {base_a}. Keep each step very short."
+    )
+
+    st.session_state["explain3"] = {"picture": picture, "story": story, "steps": steps}
+    st.session_state["explain3_q"] = base_q
+    return st.session_state["explain3"]
+
 def ask_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
     name = st.session_state.get("child_name","Kid")
     age = st.session_state.get("kid_age")
     category = st.session_state.get("topic_category")
-
-    # One-time age compliment
     msg = st.session_state.pop("age_celebrate_msg", None)
-    if msg:
-        st.markdown(f"<div class='age-toast'>{html.escape(msg)}</div>", unsafe_allow_html=True)
+
+    # Show rotating compliment chips when arriving from age step
+    if msg == "age_ready":
+        try: play_win_sound()
+        except Exception: pass
         st.balloons()
-        try:
-            play_win_sound()
-        except Exception:
-            pass
+
+        comps = st.session_state.get("age_compliments_list", [])
+        idx = st.session_state.get("age_comp_index", 0)
+        # pick 3 (rotate start index)
+        if comps:
+            rot = comps[idx:] + comps[:idx]
+            show = rot[:3] if len(rot) >= 3 else rot
+            st.markdown("#### 🎉 You're awesome!")
+            st.markdown("<div class='compliment-row'>", unsafe_allow_html=True)
+            for c in show:
+                st.markdown(f"<div class='comp-chip'><span class='float-emoji'></span>{html.escape(c)}</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+            if st.button("🔄 Another compliment"):
+                st.session_state["age_comp_index"] = (idx + 1) % max(1, len(comps))
+                st.session_state["age_celebrate_msg"] = "age_ready"  # to re-render chips
+                st.rerun()
 
     st.markdown(f"### 👋 Hello, **{name}**" + (f" — age {age}" if age else ""))
 
-    # Category chooser
+    # Category picker + Magic Button
     if not category:
         render_category_picker()
     else:
         cfg = CATEGORIES[category]
         st.markdown(
-            f"<div class='cat-card' style='--c1:{cfg['colors'][0]};--c2:{cfg['colors'][1]};margin:6px 0;'>"
-            f"<div class='cat-emoji'>{cfg['emoji']}</div>"
-            f"<div class='cat-name'>Topic: {category}</div>"
-            f"</div>",
-            unsafe_allow_html=True
+            f"<div style='background:linear-gradient(135deg,{cfg['colors'][0]},{cfg['colors'][1]});"
+            f"border-radius:14px;padding:10px 14px;color:#0b1324;font-weight:900;margin:6px 0;'>"
+            f"{cfg['emoji']} Topic: {category}</div>", unsafe_allow_html=True
         )
-        c1, c2 = st.columns([1,1])
+        c1, c2, c3 = st.columns([1,1,1])
         with c1:
             if st.button("🔄 Change topic"):
-                st.session_state.pop("topic_category", None)
-                st.rerun()
+                st.session_state.pop("topic_category", None); st.rerun()
         with c2:
             if st.button("🎯 More ideas"):
-                # Shuffle ideas for fun
-                random.shuffle(CATEGORIES[category]["ideas"])
+                random.shuffle(CATEGORIES[category]["ideas"]); st.rerun()
+        with c3:
+            # Magic Button — Surprise me: pick random category + idea, prefill question
+            if st.button("✨ Surprise me"):
+                rand_cat = random.choice(list(CATEGORIES.keys()))
+                st.session_state["topic_category"] = rand_cat
+                idea = random.choice(CATEGORIES[rand_cat]["ideas"])
+                st.session_state["prefill_child_question"] = idea
                 st.rerun()
 
         render_idea_chips(category)
 
-    # Question box
     default_q = st.session_state.pop("prefill_child_question", None)
     if default_q is not None:
         st.session_state.pop("child_question", None)
@@ -466,21 +504,18 @@ def ask_step():
     else:
         question = st.text_input("❓ What do you want to ask?", key="child_question")
 
-    # Mic or upload
-    audio_bytes, source = audio_input_ui()
+    audio_bytes, _ = audio_input_ui()
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
         with st.spinner("Transcribing…"):
             text, err = transcribe_audio(audio_bytes)
         if text:
             st.session_state['prefill_child_question'] = text
-            st.success("✅ Added your question above.")
-            st.rerun()
+            st.success("✅ Added your question above."); st.rerun()
         else:
             st.error("🛑 Couldn't transcribe your audio.")
             if err: st.caption(err)
 
-    # Actions
     c1, c2, c3 = st.columns([1,1,1])
     with c1:
         if st.button("✨ Get Answer", use_container_width=True):
@@ -491,6 +526,7 @@ def ask_step():
                 st.session_state["last_answer"] = answer
                 st.session_state["last_question"] = question.strip()
                 st.session_state["just_answered"] = True
+                save_qa_log(name, question.strip(), answer)
                 st.rerun()
     with c2:
         if st.button("🔊 Read Aloud", use_container_width=True):
@@ -504,23 +540,40 @@ def ask_step():
                 st.info("Ask something first!")
     with c3:
         if st.button("🔁 Ask another", use_container_width=True):
-            st.session_state.pop("last_answer", None)
-            st.session_state.pop("last_question", None)
-            st.rerun()
+            st.session_state.pop("last_answer", None); st.session_state.pop("last_question", None); st.rerun()
 
-    # Answer card
     if st.session_state.get("last_answer"):
         if st.session_state.pop("just_answered", False):
             st.balloons()
-            try:
-                play_win_sound()
-            except Exception:
-                pass
-        st.markdown("<div class='pulse-card'>", unsafe_allow_html=True)
-        st.markdown("#### 🌟 Answer")
-        st.write(st.session_state["last_answer"])
-        st.markdown("</div>", unsafe_allow_html=True)
+            try: play_win_sound()
+            except Exception: pass
 
+        st.markdown("#### 🌟 Answer")
+        st.success(st.session_state["last_answer"])
+
+        # === Explain 3 Ways (tabs) ============================================
+        st.markdown("#### Explain 3 Ways")
+        tabs = st.tabs(["🖼 Picture", "📖 Story", "🪜 Steps"])
+        e3 = _explain_three_ways(
+            st.session_state.get("last_question",""),
+            st.session_state["last_answer"],
+            age,
+            st.session_state.get("topic_category")
+        )
+        with tabs[0]:
+            st.write(e3.get("picture",""))
+            if st.button("🔁 Regenerate picture explain"):
+                st.session_state.pop("explain3", None); st.experimental_rerun()
+        with tabs[1]:
+            st.write(e3.get("story",""))
+            if st.button("🔁 Regenerate story"):
+                st.session_state.pop("explain3", None); st.experimental_rerun()
+        with tabs[2]:
+            st.write(e3.get("steps",""))
+            if st.button("🔁 Regenerate steps"):
+                st.session_state.pop("explain3", None); st.experimental_rerun()
+
+        # === Understanding + Email Dad ========================================
         st.markdown("#### Did you understand it?")
         y, n = st.columns(2)
         with y:
@@ -529,13 +582,119 @@ def ask_step():
         with n:
             if st.button("✉️ Email Dad (I don't understand)", key="understand_no", use_container_width=True):
                 with st.spinner("Sending email to Dad..."):
-                    ok, msg = send_email_to_dad(child_name=name, question=st.session_state.get("last_question",""), answer=st.session_state["last_answer"])
-                if ok: st.success("Email sent to Dad ✅"); st.caption(msg)
-                else: st.error("Couldn't send email ❌"); st.code(msg, language="text")
+                    ok, msg = send_email_to_dad(
+                        child_name=name,
+                        question=st.session_state.get("last_question",""),
+                        answer=st.session_state["last_answer"]
+                    )
+                if ok:
+                    st.success("Email sent to Dad ✅"); st.caption(msg)
+                else:
+                    st.error("Couldn't send email ❌"); st.code(msg, language="text")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ========================= MAIN TABS ===========================================
+# ===== NEON THEME =============================================================
+NEON_CSS = """
+<style>
+:root{
+  --neon:#3DF0A5; --neon2:#5BB9FF; --bg:#020617; --glass: rgba(15,23,42,.55);
+  --txt:#E6F1FF; --dim:#90A4B4;
+}
+.neon-bg{ position:relative; background:radial-gradient(ellipse at top,#0b1b33 0%,#020617 60%);
+  padding:8px; border-radius:24px; box-shadow:0 0 40px rgba(61,240,165,.08) inset;
+}
+.neon-grid:before{
+  content:""; position:absolute; inset:-20px;
+   background:
+   radial-gradient(2px 2px at 20px 20px, rgba(93,185,255,.7), transparent 60%) 0 0/36px 36px,
+   radial-gradient(2px 2px at 10px 10px, rgba(61,240,165,.6), transparent 60%) 0 0/30px 30px;
+  filter: blur(.4px); opacity:.35; animation: drift 16s linear infinite;
+}
+@keyframes drift{ 0%{transform:translateY(0)} 100%{transform:translateY(-36px)} }
+
+.neon-header{
+  display:flex; align-items:center; gap:10px; padding:10px 16px; border-radius:16px;
+  background:linear-gradient(90deg, rgba(61,240,165,.18), rgba(91,185,255,.18));
+  border:2px solid rgba(91,185,255,.35);
+  box-shadow:0 0 16px rgba(61,240,165,.25), inset 0 0 20px rgba(91,185,255,.12);
+  color:var(--txt); font-weight:900; letter-spacing:.5px;
+}
+.neon-chip{font-size:14px;color:var(--dim);margin-left:auto}
+
+.neon-window{
+  margin-top:10px; border-radius:26px; padding:16px; min-height:360px;
+   background:linear-gradient(180deg, rgba(10,19,39,.85), rgba(6,12,25,.85));
+  border:2px solid rgba(61,240,165,.35);
+  box-shadow:0 0 18px rgba(61,240,165,.25), inset 0 0 28px rgba(91,185,255,.14);
+  color:var(--txt);
+}
+.msg{max-width:80%; padding:10px 14px; border-radius:14px; margin:8px 0; display:inline-block}
+.msg.user{background:rgba(91,185,255,.18); border:1px solid rgba(91,185,255,.45)}
+.msg.bot{background:rgba(61,240,165,.16); border:1px solid rgba(61,240,165,.45)}
+.row{display:flex;gap:8px} .right{justify-content:flex-end}
+
+.neon-input{
+  margin-top:12px; display:flex; gap:8px; align-items:center;
+  background:var(--glass); border:2px solid rgba(91,185,255,.35); border-radius:18px; padding:8px;
+  box-shadow: inset 0 0 14px rgba(91,185,255,.10);
+}
+.neon-input input{ background:transparent!important; color:var(--txt)!important; }
+.neon-send button{
+  width:64px; height:44px; border-radius:12px; border:2px solid rgba(61,240,165,.55)!important;
+  background:linear-gradient(180deg, rgba(61,240,165,.25), rgba(91,185,255,.20))!important;
+  color:#0d1b2a!important; font-weight:900; box-shadow:0 0 18px rgba(61,240,165,.28);
+}
+.small{font-size:12px;color:var(--dim)}
+</style>
+"""
+
+def render_neon_chat_ui():
+    st.markdown(NEON_CSS, unsafe_allow_html=True)
+    age  = st.session_state.get("kid_age")
+    category = st.session_state.get("topic_category","General")
+
+    if "neon_chat" not in st.session_state:
+        st.session_state.neon_chat = []
+
+    st.markdown('<div class="neon-bg neon-grid">', unsafe_allow_html=True)
+    st.markdown(f'''
+      <div class="neon-header">
+        <span>🤖 Ask DAD AI</span>
+        <span class="neon-chip">Topic: {category} • Age: {age or "?"}</span>
+      </div>''', unsafe_allow_html=True)
+
+    st.markdown('<div class="neon-window">', unsafe_allow_html=True)
+    if not st.session_state.neon_chat:
+        st.markdown('<div class="small">How can I help you?</div>', unsafe_allow_html=True)
+    for role, text in st.session_state.neon_chat[-12:]:
+        cls = "right" if role=="user" else ""
+        who = "user" if role=="user" else "bot"
+        st.markdown(f'<div class="row {cls}"><div class="msg {who}">{html.escape(text)}</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    col_in, col_btn = st.columns([1,0.18])
+    with col_in:
+        q = st.text_input(" ", key="child_question", label_visibility="collapsed",
+                          placeholder="Type your question…")
+    with col_btn:
+        send = st.button("➤", key="neon_send", use_container_width=True, help="Send")
+
+    if send and q.strip():
+        st.session_state.neon_chat.append(("user", q.strip()))
+        try:
+            ans = ask_with_context(q.strip(), st.session_state.get("topic_category"), age)
+        except Exception:
+            ans = "Sorry, couldn't answer right now."
+        st.session_state.neon_chat.append(("bot", ans))
+        st.session_state["last_answer"] = ans
+        st.session_state["last_question"] = q.strip()
+        st.session_state["child_question"] = ""
+        st.rerun()
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ========================= MAIN TABS ==========================================
 if tab == "💬 Ask DAD AI":
     st.title("👨‍👧 Ask DAD AI")
     step = st.session_state.get("onboarding_step", "name")
@@ -546,7 +705,10 @@ if tab == "💬 Ask DAD AI":
     else:
         if "child_name" not in st.session_state:
             st.session_state["child_name"] = (st.session_state.get("kid_name","") or "Kid").strip()
-        ask_step()
+        if ui_style == "Neon":
+            render_neon_chat_ui()
+        else:
+            ask_step()
 
 elif tab == "🐾 Animal Fun":
     st.title("🐾 Animal Fun"); st.write("Type an animal name to play a sound, or generate a fun drawing!")
