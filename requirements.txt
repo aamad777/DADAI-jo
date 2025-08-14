@@ -1,19 +1,24 @@
-# Core app dependencies
-streamlit
+# Core
+streamlit==1.36.0
 python-dotenv
 openai
 Pillow
 audio-recorder-streamlit
 streamlit-drawable-canvas
 google-generativeai
-pdfminer.six
 requests
 
-# OCR and PDF tools
+# PDF text extraction (better than pdfminer alone)
+pymupdf
+pdfminer.six
+
+# OCR for scanned PDFs (Arabic + English)
 pytesseract
 pdf2image
-pymupdf
 
-# (Optional but good for OCR on non-Latin languages)
+# Arabic text rendering helpers (optional)
 arabic-reshaper
 python-bidi
+
+# Simple search for book Q&A
+scikit-learn
