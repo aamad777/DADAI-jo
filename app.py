@@ -1,5 +1,5 @@
 # app.py — Ask DAD AI (Arabic + PDF Learning + Alpha Lists + Neon/Classic UI)
-import os, json, threading, queue, random, html, tempfile
+import os, json, threading, queue, random, html, tempfile, shutil, importlib
 from datetime import datetime
 from io import BytesIO
 
@@ -18,7 +18,6 @@ except Exception:
 from drawing import generate_drawing_with_stability
 from sound import play_animal_sound
 from dashboard import render_dashboard_tab
-# replaced external learn module with local Arabic/English PDF tab below
 from kid_feedback import send_email_to_dad
 from quiz_game import get_quiz_question
 from quiz_sounds import play_correct_sound, play_wrong_sound, play_win_sound
@@ -80,7 +79,6 @@ def _google_stt_worker(audio_bytes: bytes, out_q: "queue.Queue[tuple[str|None, s
         out_q.put((None, f"STT failed: {e}"))
 
 def transcribe_audio(audio_bytes: bytes):
-    # Whisper first
     if os.getenv("OPENAI_API_KEY"):
         try:
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -93,7 +91,6 @@ def transcribe_audio(audio_bytes: bytes):
                 return text, None
         except Exception:
             pass
-    # Google in a thread with timeout
     out_q: "queue.Queue[tuple[str|None, str|None]]" = queue.Queue(maxsize=1)
     t = threading.Thread(target=_google_stt_worker, args=(audio_bytes, out_q), daemon=True)
     t.start(); t.join(STT_TIMEOUT_SECS)
@@ -122,8 +119,6 @@ st.markdown("""
 @keyframes kidsRainbow { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
 .kids-ui [data-testid="stHorizontalBlock"] { gap: 6px !important; }
 .kids-ui [data-testid="column"] { padding-left: 2px !important; padding-right: 2px !important; }
-
-/* Name bubbles */
 .name-bubbles { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px; }
 .bubble {
   display:inline-block; padding:.26rem .52rem; border-radius:12px;
@@ -135,7 +130,6 @@ st.markdown("""
   border: 2px solid rgba(255,255,255,.5);
 }
 @keyframes popIn { to { transform: translateY(0) scale(1); opacity:1; } }
-
 .wave {
   font-size: 42px; font-weight: 900; letter-spacing: 1px; margin: 6px 0 4px 0;
   background: linear-gradient(90deg,#22c55e,#06b6d4,#a78bfa,#f97316);
@@ -143,8 +137,6 @@ st.markdown("""
   animation: hue 6s linear infinite;
 }
 @keyframes hue { 0%{filter:hue-rotate(0deg)} 100%{filter:hue-rotate(360deg)} }
-
-/* Compliment chips + floating emoji */
 .compliment-row { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 2px 0; }
 .comp-chip {
   display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px;
@@ -261,7 +253,6 @@ def render_alpha_steps(text_block: str):
     cleaned = []
     for ln in lines:
         ln = ln.lstrip("-•*").strip()
-        # strip leading numbers/letters like '1.', '1)', 'a)', 'A.'
         if len(ln) > 2 and (ln[0].isdigit() or ln[0].isalpha()) and ln[1] in [")", ".", "）", "．"]:
             ln = ln[2:].strip()
         cleaned.append(ln)
@@ -286,12 +277,10 @@ def ask_with_context(question: str, category: str | None, age: int | None) -> st
         f"Topic: {topic}. Keep it short, clear, and fun. Use simple words. "
         f"{_lang_hint()}"
     )
-    # Try Gemini first
     try:
         return ask_gemini(f"{instruction}\nQuestion: {question}")
     except Exception:
         pass
-    # Fallback OpenAI
     if client:
         try:
             resp = client.chat.completions.create(
@@ -597,7 +586,6 @@ def ask_step():
         st.markdown(_("#### 🌟 Answer", "#### 🌟 الإجابة"))
         st.success(st.session_state["last_answer"])
 
-        # === Explain 3 Ways (tabs) ============================================
         st.markdown(_("#### Explain 3 Ways", "#### اشرح بثلاث طرق"))
         tabs = st.tabs([_("🖼 Picture", "🖼 صورة"), _("📖 Story", "📖 قصة"), _("🪜 Steps", "🪜 خطوات")])
         e3 = _explain_three_ways(
@@ -619,7 +607,6 @@ def ask_step():
             if st.button(_("🔁 Regenerate steps", "🔁 إعادة توليد الخطوات")):
                 st.session_state.pop("explain3", None); st.rerun()
 
-        # === Understanding + Email Dad ========================================
         st.markdown(_("#### Did you understand it?", "#### هل فهمت الإجابة؟"))
         y, n = st.columns(2)
         with y:
@@ -659,7 +646,6 @@ NEON_CSS = """
   filter: blur(.4px); opacity:.35; animation: drift 16s linear infinite;
 }
 @keyframes drift{ 0%{transform:translateY(0)} 100%{transform:translateY(-36px)} }
-
 .neon-header{
   display:flex; align-items:center; gap:10px; padding:10px 16px; border-radius:16px;
   background:linear-gradient(90deg, rgba(61,240,165,.18), rgba(91,185,255,.18));
@@ -668,7 +654,6 @@ NEON_CSS = """
   color:var(--txt); font-weight:900; letter-spacing:.5px;
 }
 .neon-chip{font-size:14px;color:var(--dim);margin-left:auto}
-
 .neon-window{
   margin-top:10px; border-radius:26px; padding:16px; min-height:360px;
    background:linear-gradient(180deg, rgba(10,19,39,.85), rgba(6,12,25,.85));
@@ -680,7 +665,6 @@ NEON_CSS = """
 .msg.user{background:rgba(91,185,255,.18); border:1px solid rgba(91,185,255,.45)}
 .msg.bot{background:rgba(61,240,165,.16); border:1px solid rgba(61,240,165,.45)}
 .row{display:flex;gap:8px} .right{justify-content:flex-end}
-
 .neon-input{
   margin-top:12px; display:flex; gap:8px; align-items:center;
   background:var(--glass); border:2px solid rgba(91,185,255,.35); border-radius:18px; padding:8px;
@@ -742,7 +726,6 @@ def render_neon_chat_ui():
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ===== PDF Learning Book (Arabic/English) =====================================
-# Strong extractor -> fallback -> OCR
 def _extract_text_pymupdf(file_bytes: bytes) -> str:
     try:
         import fitz  # PyMuPDF
@@ -762,12 +745,11 @@ def _extract_text_pymupdf(file_bytes: bytes) -> str:
         return ""
 
 def _extract_text_pdfminer(file_bytes: bytes) -> str:
-    # handle both import names across pdfminer.six versions
     try:
-        from pdfminer_high_level import extract_text  # type: ignore
+        from pdfminer_high_level import extract_text  # some builds
     except Exception:
         try:
-            from pdfminer.high_level import extract_text  # type: ignore
+            from pdfminer.high_level import extract_text  # other builds
         except Exception:
             return ""
     try:
@@ -778,19 +760,35 @@ def _extract_text_pdfminer(file_bytes: bytes) -> str:
         return ""
 
 def _extract_text_ocr(file_bytes: bytes, lang: str) -> str:
+    """OCR via pytesseract + pdf2image. Returns '' if deps missing; prints reasons."""
     try:
         import pytesseract
         from pdf2image import convert_from_bytes
-    except Exception:
+    except Exception as e:
+        st.caption(f"OCR import error: {e}")
+        return ""
+
+    t_bin = shutil.which("tesseract")
+    if not t_bin:
+        st.caption("OCR error: 'tesseract' binary not found on PATH.")
         return ""
     try:
+        pytesseract.pytesseract.tesseract_cmd = t_bin
+    except Exception as e:
+        st.caption(f"OCR set cmd error: {e}")
+        return ""
+
+    if not shutil.which("pdftoppm"):
+        st.caption("OCR error: 'pdftoppm' (poppler-utils) not found.")
+        return ""
+
+    try:
         pages = convert_from_bytes(file_bytes)
-        texts = []
         tess_lang = "ara" if lang.startswith("ar") else "eng"
-        for img in pages:
-            texts.append(pytesseract.image_to_string(img, lang=tess_lang))
+        texts = [pytesseract.image_to_string(img, lang=tess_lang) for img in pages]
         return "\n".join(texts)
-    except Exception:
+    except Exception as e:
+        st.caption(f"OCR runtime error: {e}")
         return ""
 
 def extract_text_from_pdf(file_bytes: bytes, lang: str) -> str:
@@ -861,6 +859,22 @@ def cache_bust():
     st.query_params = qp
 
 def render_learning_book_tab_local():
+    # --- OCR diagnostics expander ---
+    with st.expander(_("🔧 OCR diagnostics (click to open)", "🔧 فحص OCR (اضغط للعرض)")):
+        pkgs = ["pymupdf", "pdfminer.six", "pytesseract", "pdf2image", "scikit-learn"]
+        rows = []
+        for p in pkgs:
+            mod_name = p.split("==")[0].replace("-", "_")
+            try:
+                importlib.import_module(mod_name)
+                ok = "✅"
+            except Exception as e:
+                ok = f"❌ ({e})"
+            rows.append(f"- {p}: {ok}")
+        st.markdown("\n".join(rows))
+        st.markdown(f"- tesseract: {shutil.which('tesseract') or '❌ not found'}")
+        st.markdown(f"- pdftoppm: {shutil.which('pdftoppm') or '❌ not found'}")
+
     st.write(_("Upload a PDF book (English or Arabic). We'll search it first before using AI.",
                "ارفع كتاب PDF (عربي أو إنجليزي). سنبحث فيه أولاً قبل استخدام الذكاء الاصطناعي."))
     file = st.file_uploader(_("Choose a PDF", "اختر ملف PDF"), type=["pdf"])
@@ -935,7 +949,6 @@ elif tab == _("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"):
     render_dashboard_tab()
 
 elif tab == _("📚 Learning Book", "📚 كتاب التعلم"):
-    # small cache-buster to avoid stale static chunks after deploy
     cache_bust()
     st.title(_("📚 Learning Book", "📚 كتاب التعلم"))
     render_learning_book_tab_local()
