@@ -1,3 +1,6 @@
 tesseract-ocr
 tesseract-ocr-ara
 poppler-utils
+ocrmypdf
+libgl1
+fonts-dejavu-core
