@@ -157,9 +157,10 @@ st.markdown("""
 .alpha-chip {
   display:inline-flex; align-items:center; justify-content:center;
   width:28px; height:28px; border-radius:50%;
-  margin-right:8px; font-weight:900; color:#0b1324;
+  margin: 0 auto 6px auto; font-weight:900; color:#0b1324;
   background: linear-gradient(135deg,var(--g1),var(--g2));
   box-shadow:0 4px 10px rgba(0,0,0,.12);
+  line-height:28px;
 }
 .alpha-row { display:flex; align-items:flex-start; gap:8px; margin:6px 0; }
 </style>
@@ -172,7 +173,6 @@ if is_ar():
       html, body, [data-testid="stAppViewContainer"] * { direction: rtl; text-align: right; }
       .neon-input input, .msg, .stTextInput, .stButton { text-align: right !important; }
       .alpha-row { flex-direction: row-reverse; }
-      .alpha-chip { margin-right:0; margin-left:8px; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -383,19 +383,16 @@ def age_step():
     st.subheader(tr("🎂 How old are you?","🎂 كم عمرك؟"))
     st.caption(tr("Tap one","اختر عمرك"))
 
-    # Colorful alphabet‑style age chips (1..10)
+    # Colorful alphabet‑style age chips (1..10) — HTML chip above, plain button below.
     row = st.columns(10)
     picked = None
     for i, n in enumerate(range(1, 11)):
         g1, g2 = random.choice(ALPHA_COLORS)
         chip_html = f"<span class='alpha-chip' style='--g1:{g1};--g2:{g2}'>{n}</span>"
         with row[i]:
-            if st.button(chip_html, key=f"age_{n}", help=str(n), use_container_width=True):
+            st.markdown(f"<div style='text-align:center'>{chip_html}</div>", unsafe_allow_html=True)
+            if st.button(tr("Pick","اختر"), key=f"age_{n}", use_container_width=True, help=str(n)):
                 picked = n
-            st.markdown(
-                f"<div style='text-align:center;font-weight:900;color:#0b1324;opacity:.85'>{n}</div>",
-                unsafe_allow_html=True
-            )
 
     if picked is not None:
         st.session_state["kid_age"] = picked
@@ -460,7 +457,7 @@ def _explain_three_ways(base_q: str, base_a: str, age: int | None, category: str
             pass
         if client:
             try:
-                resp = client.chat_completions.create(  # NOTE: old SDKs use chat.completions; keep yours if needed
+                resp = client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role":"user","content":prompt}],
                     temperature=0.5, max_tokens=220
@@ -542,7 +539,7 @@ def ask_step():
                                  value=default_q, key="ask_input")
     else:
         question = st.text_input(tr("❓ What do you want to ask?","❓ ما الذي تريد سؤاله؟"), key="ask_input")
-    audio_bytes, src = audio_input_ui()  # <- no "_" shadowing
+    audio_bytes, src = audio_input_ui()
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
         with st.spinner(tr("Transcribing…","جاري التفريغ الصوتي…")):
