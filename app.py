@@ -1,27 +1,22 @@
-# app.py — Ask DAD AI (Arabic + Neon + Robust PDF + Alpha Lists + Book Library)
-from rag_arabic import robust_extract_text, LocalBookIndex, normalize_arabic
-import os, json, threading, queue, random, html, tempfile
+# app.py — Ask DAD AI (Classic + Neon UI + Arabic + Robust PDF + Book-first QA)
+
+import os, json, threading, queue, random, html, tempfile, re
 from datetime import datetime
 from io import BytesIO
+from typing import List, Tuple
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# NEW: local library manager
-from book_store import (
-    save_book, list_books, load_book, delete_book,
-    get_active_book_id, set_active_book_id, build_context_for_question
-)
-
-# ---- Optional mic widget ----
+# ---- Optional mic widget (graceful fallback if not installed) ----
 try:
-    from audio_recorder_streamlit import audio_recorder
+    from audio_recorder_streamlit import audio_recorder  # pip install audio-recorder-streamlit
     HAS_AUDIO_RECORDER = True
 except Exception:
     HAS_AUDIO_RECORDER = False
 
-# ---- Project modules ----
+# ---- Project modules already in your repo ----
 from drawing import generate_drawing_with_stability
 from sound import play_animal_sound
 from dashboard import render_dashboard_tab
@@ -32,9 +27,8 @@ from quiz_scoreboard import log_score, show_scoreboard
 from streamlit_drawable_canvas import st_canvas
 from gemini_ai import classify_sketch, fetch_animal_photo, ask_gemini
 
+# ---------------------------------------------------------------
 load_dotenv()
-
-# Optional OpenAI (fallback + Whisper STT)
 openai_api_key = os.getenv("OPENAI_API_KEY", "")
 client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 
@@ -52,6 +46,7 @@ def get_lang() -> str:
 def is_ar() -> bool:
     return get_lang().startswith("ar")
 
+# translator helper (renamed from "_" to avoid collisions)
 def tr(en: str, ar: str) -> str:
     return ar if is_ar() else en
 
@@ -128,6 +123,7 @@ st.markdown("""
 .kids-ui [data-testid="stHorizontalBlock"] { gap: 6px !important; }
 .kids-ui [data-testid="column"] { padding-left: 2px !important; padding-right: 2px !important; }
 
+/* Name bubbles */
 .name-bubbles { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px; }
 .bubble {
   display:inline-block; padding:.26rem .52rem; border-radius:12px;
@@ -148,6 +144,7 @@ st.markdown("""
 }
 @keyframes hue { 0%{filter:hue-rotate(0deg)} 100%{filter:hue-rotate(360deg)} }
 
+/* Compliments */
 .compliment-row { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 2px 0; }
 .comp-chip {
   display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px;
@@ -158,8 +155,8 @@ st.markdown("""
 .float-emoji:before { content:"🎉"; position:absolute; left:-6px; top:-10px; opacity:.85; animation: floatUp 1.6s ease-in-out infinite; }
 @keyframes floatUp { 0%{ transform: translateY(4px); opacity:.8} 50%{ transform: translateY(-4px); opacity:1} 100%{ transform: translateY(4px); opacity:.8} }
 
-/* Colorful alphabet bullets & age chips */
-.alpha-chip, .age-chip {
+/* Colorful alphabet bullets */
+.alpha-chip {
   display:inline-flex; align-items:center; justify-content:center;
   width:28px; height:28px; border-radius:50%;
   margin-right:8px; font-weight:900; color:#0b1324;
@@ -167,10 +164,15 @@ st.markdown("""
   box-shadow:0 4px 10px rgba(0,0,0,.12);
 }
 .alpha-row { display:flex; align-items:flex-start; gap:8px; margin:6px 0; }
-.age-tile {
-  display:flex; flex-direction:column; align-items:center; gap:6px;
-  padding:6px 4px; border-radius:14px; border:1px solid rgba(0,0,0,.05);
-  background:#fff; box-shadow:0 4px 12px rgba(0,0,0,.04);
+
+/* For age chips */
+.age-chip {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:28px; height:28px; border-radius:50%;
+  font-weight:900; color:#0b1324;
+  background: linear-gradient(135deg,var(--g1),var(--g2));
+  box-shadow:0 4px 10px rgba(0,0,0,.12);
+  margin-bottom:6px;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -195,13 +197,12 @@ st.session_state["lang"] = LANGS[lang_choice]
 tab = st.sidebar.radio(tr("Choose a tab:", "اختر صفحة:"),
     [
         tr("💬 Ask DAD AI", "💬 اسأل بابا الذكي"),
-        tr("📖 Book Library", "📖 مكتبة الكتب"),        # NEW
-        tr("📚 Learning Book", "📚 كتاب التعلم"),
         tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"),
         tr("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"),
+        tr("📚 Learning Book", "📚 كتاب التعلم"),
         tr("🧠 Quiz Fun", "🧠 مسابقة ممتعة"),
         tr("📊 Scoreboard", "📊 لوحة النتائج"),
-        tr("🎨 Draw & Guess (Gemini)", "🎨 ارسم وخمّن (Gemini)"),
+        tr("🎨 Draw & Guess (Gemini)", "🎨 ارسم وخمّن (Gemini)")
     ]
 )
 
@@ -268,17 +269,16 @@ ALPHA_COLORS = [
     ("#fde68a","#fca5a5"), ("#bbf7d0","#86efac"), ("#c7d2fe","#93c5fd"),
     ("#fbcfe8","#fda4af"), ("#bae6fd","#93c5fd"), ("#d1fae5","#a7f3d0"),
 ]
-def alpha_labels(options):
-    return [f"{chr(65+i)}. {opt}" for i, opt in enumerate(options)]
 
 def render_alpha_steps(text_block: str):
+    """Render steps as A) B) C) with colorful round chips."""
     if not text_block.strip():
         return
     lines = [ln.strip() for ln in text_block.splitlines() if ln.strip()]
     cleaned = []
     for ln in lines:
         ln = ln.lstrip("-•*").strip()
-        while len(ln) > 1 and (ln[0].isdigit() or ln[0].isalpha()) and ln[1] in [")",".","］","】","）","．"]:
+        while len(ln) > 1 and (ln[0].isdigit() or ln[0].isalpha()) and ln[1] in [")", ".", "］", "】", "）", "．"]:
             ln = ln[2:].strip()
         cleaned.append(ln)
     for i, ln in enumerate(cleaned):
@@ -286,117 +286,16 @@ def render_alpha_steps(text_block: str):
         chip = f"<span class='alpha-chip' style='--g1:{g1};--g2:{g2}'>{chr(65+i)}</span>"
         st.markdown(f"<div class='alpha-row'>{chip}<div>{html.escape(ln)}</div></div>", unsafe_allow_html=True)
 
-# ===== PDF extraction (robust) ===============================================
-def _extract_text_pymupdf(file_bytes: bytes) -> str:
-    try:
-        import fitz  # PyMuPDF
-    except Exception:
-        return ""
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        parts = []
-        for page in doc:
-            t = page.get_text("text")
-            if t.strip():
-                parts.append(t)
-        return "\n".join(parts)
-    except Exception:
-        return ""
-
-def _extract_text_pdfminer(file_bytes: bytes) -> str:
-    try:
-        from pdfminer.high_level import extract_text
-    except Exception:
-        try:
-            from pdfminer_high_level import extract_text  # alt env naming
-        except Exception:
-            return ""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file_bytes); tmp.flush()
-            return extract_text(tmp.name) or ""
-    except Exception:
-        return ""
-
-def _ocr_available() -> bool:
-    try:
-        import pytesseract  # noqa
-        from pdf2image import convert_from_bytes  # noqa
-        return True
-    except Exception:
-        return False
-
-def _extract_text_ocr(file_bytes: bytes, lang: str) -> str:
-    try:
-        import pytesseract
-        from pdf2image import convert_from_bytes
-    except Exception:
-        return ""
-    try:
-        poppler_path = os.getenv("POPPLER_PATH")
-        pages = convert_from_bytes(file_bytes, poppler_path=poppler_path) if poppler_path else convert_from_bytes(file_bytes)
-        tess_lang = "ara" if lang.startswith("ar") else "eng"
-        return "\n".join(pytesseract.image_to_string(img, lang=tess_lang) for img in pages)
-    except Exception:
-        return ""
-
-def extract_text_from_pdf(file_bytes: bytes, lang: str) -> tuple[str, bool]:
-    """
-    Returns (text, used_ocr)
-    """
-    txt = _extract_text_pymupdf(file_bytes)
-    if len((txt or "").strip()) >= 50:
-        return txt, False
-    txt = _extract_text_pdfminer(file_bytes)
-    if len((txt or "").strip()) >= 50:
-        return txt, False
-    if _ocr_available():
-        return _extract_text_ocr(file_bytes, lang), True
-    return "", True  # OCR needed but not available
-
-# ===== Book-first answering ===================================================
+# ===== Model wrapper ==========================================================
 def _lang_hint():
     return "Respond in Arabic (Modern Standard Arabic) with very simple words." if is_ar() \
            else "Respond in English with very simple words."
 
-def answer_with_book_then_ai(question: str, category: str | None, age: int | None) -> str:
-    """
-    First try the active library book (TF‑IDF retrieval) → then AI fallback.
-    """
-    # 0) pre-baked answers
+def ask_with_context(question: str, category: str | None, age: int | None) -> str:
     answers = load_answers()
     for k, v in answers.items():
         if k.lower() in question.lower():
             return v
-
-    # 1) Book first
-    active_id = get_active_book_id()
-    if active_id:
-        ctx, score = build_context_for_question(question, active_id, top_k=5)
-        if ctx.strip() and score >= 0.12:  # threshold can be tuned
-            prompt = (
-                f"Use the following book excerpts to answer the kid's question.\n\n"
-                f"EXCERPTS:\n{ctx}\n\n"
-                f"QUESTION: {question}\n\n"
-                f"RULES: Answer briefly for kids; if unsure, say you aren't sure. {_lang_hint()}"
-            )
-            try:
-                return ask_gemini(prompt).strip()
-            except Exception:
-                pass
-            if client:
-                try:
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role":"user","content":prompt}],
-                        temperature=0.4, max_tokens=220
-                    )
-                    ans = (resp.choices[0].message.content or "").strip()
-                    if ans: return ans
-                except Exception:
-                    pass
-
-    # 2) General AI
     topic = category or "General"
     age_text = f"{age}" if age else tr("kid","طفل")
     instruction = (
@@ -405,7 +304,7 @@ def answer_with_book_then_ai(question: str, category: str | None, age: int | Non
         f"{_lang_hint()}"
     )
     try:
-        return ask_gemini(f"{instruction}\nQuestion: {question}").strip()
+        return ask_gemini(f"{instruction}\nQuestion: {question}")
     except Exception:
         pass
     if client:
@@ -418,9 +317,8 @@ def answer_with_book_then_ai(question: str, category: str | None, age: int | Non
             )
             return (resp.choices[0].message.content or "").strip()
         except Exception as e:
-            return tr(f"Sorry, I couldn't answer right now: {e}",
-                      f"عذراً، لا أستطيع الإجابة الآن: {e}")
-    return tr("Sorry, I couldn't answer right now.","عذراً، لا أستطيع الإجابة الآن.")
+            return tr(f"Sorry, I couldn't answer right now: {e}", f"عذراً، لا أستطيع الإجابة الآن: {e}")
+    return tr("Sorry, I couldn't answer right now.", "عذراً، لا أستطيع الإجابة الآن.")
 
 # ===== Audio input (mic if available, else WAV upload) ========================
 def audio_input_ui():
@@ -457,6 +355,186 @@ def bubble_name_html(name: str) -> str:
         spans.append(f"<span class='bubble' style='--c1:{c1};--c2:{c2};--d:{delay}'>{safe}</span>")
     return "<div class='name-bubbles'>" + "".join(spans) + "</div>"
 
+# ===== Arabic-friendly extraction + embeddings (self-contained) ===============
+# (Same logic you would normally put in a separate module)
+ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06ED]")
+
+def normalize_arabic(s: str) -> str:
+    s = ARABIC_DIACRITICS.sub("", s)
+    s = s.replace("ـ", "")
+    s = re.sub("[إأآا]", "ا", s)
+    s = s.replace("ى", "ي").replace("ئ", "ي").replace("ؤ", "و").replace("ة", "ه")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def extract_text_pymupdf_blocks(pdf_bytes: bytes) -> str:
+    try:
+        import fitz
+    except Exception:
+        return ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = []
+        for p in doc:
+            blocks = p.get_text("blocks")
+            blocks.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))  # y then x
+            page = []
+            for b in blocks:
+                t = (b[4] or "").strip()
+                if t:
+                    page.append(t)
+            pages.append("\n".join(page))
+        return "\n\n".join(pages)
+    except Exception:
+        return ""
+
+def extract_text_pdfminer(pdf_bytes: bytes) -> str:
+    try:
+        from pdfminer.high_level import extract_text
+    except Exception:
+        return ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes); tmp.flush()
+            return extract_text(tmp.name) or ""
+    except Exception:
+        return ""
+
+def ocr_with_ocrmypdf_then_extract(pdf_bytes: bytes) -> str:
+    try:
+        import subprocess, fitz
+    except Exception:
+        return ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
+            src.write(pdf_bytes); src.flush()
+            dst = src.name.replace(".pdf", ".ocr.pdf")
+        cmd = ["ocrmypdf", "--force-ocr", "--deskew", "--clean", "--ocr-image-dpi", "300", "--optimize", "1", src.name, dst]
+        subprocess.run(cmd, check=True, capture_output=True)
+        doc = fitz.open(dst)
+        return "\n".join((p.get_text("text") or "") for p in doc)
+    except Exception:
+        return ""
+
+def ocr_pdf_images(pdf_bytes: bytes, lang: str="ar") -> str:
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+        from PIL import Image, ImageOps, ImageFilter
+    except Exception:
+        return ""
+    tess_lang = "ara+eng" if lang.startswith("ar") else "eng"
+    poppler_path = os.getenv("POPPLER_PATH", None)
+    pages = convert_from_bytes(pdf_bytes, dpi=400, poppler_path=poppler_path) \
+            if poppler_path else convert_from_bytes(pdf_bytes, dpi=400)
+    out = []
+    for img in pages:
+        g = ImageOps.grayscale(img)
+        g = ImageOps.autocontrast(g)
+        g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3))
+        cfg = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
+        out.append(pytesseract.image_to_string(g, lang=tess_lang, config=cfg))
+    return "\n".join(out)
+
+def robust_extract_text(pdf_bytes: bytes, lang: str="ar") -> Tuple[str, str]:
+    t1 = extract_text_pymupdf_blocks(pdf_bytes)
+    if len(normalize_arabic(t1)) > 120:
+        return t1, "pymupdf-blocks"
+    t2 = extract_text_pdfminer(pdf_bytes)
+    if len(normalize_arabic(t2)) > 120:
+        return t2, "pdfminer"
+    t3 = ocr_with_ocrmypdf_then_extract(pdf_bytes)
+    if len(normalize_arabic(t3)) > 120:
+        return t3, "ocrmypdf"
+    t4 = ocr_pdf_images(pdf_bytes, lang=lang)
+    return t4, "pytesseract"
+
+def chunk_text(text: str, chunk_chars: int = 1200, overlap: int = 250) -> List[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks, i = [], 0
+    while i < len(text):
+        end = min(len(text), i + chunk_chars)
+        cut = text[i:end]
+        dot = max(cut.rfind("۔"), cut.rfind("."))  # try to stop on sentence end
+        if dot >= 0 and end - (i + dot) < 300:
+            end = i + dot + 1
+        chunks.append(text[i:end])
+        i = max(end - overlap, i + 1)
+    return chunks
+
+class LocalBookIndex:
+    def __init__(self):
+        self.model = None
+        self.index = None
+        self.chunks = []
+
+    def _load_model(self):
+        if self.model is None:
+            from sentence_transformers import SentenceTransformer
+            self.model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+    def build(self, raw_text: str):
+        self._load_model()
+        self.chunks = chunk_text(raw_text)
+        texts = [normalize_arabic(c) for c in self.chunks]
+        embs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        import faiss
+        d = embs.shape[1]
+        self.index = faiss.IndexFlatIP(d)
+        self.index.add(embs.astype("float32"))
+
+    def search_text(self, query: str, top_k: int = 6) -> str:
+        if self.index is None:
+            return ""
+        self._load_model()
+        import faiss
+        qv = self.model.encode([normalize_arabic(query)], normalize_embeddings=True).astype("float32")
+        D, I = self.index.search(qv, top_k)
+        parts = []
+        for idx in I[0]:
+            if idx >= 0:
+                parts.append(self.chunks[int(idx)])
+        return "\n\n".join(parts)
+
+# ===== Book-first QA ==========================================================
+def answer_kid_question_with_book_first(question: str, category: str | None, age: int | None) -> str:
+    passages = ""
+    book_ix = st.session_state.get("book_index")
+    if book_ix is not None:
+        try:
+            passages = book_ix.search_text(question, top_k=6)
+        except Exception:
+            passages = ""
+
+    if passages.strip():
+        prompt = (
+            f"Use the following book excerpts to answer a child's question.\n\n"
+            f"EXCERPTS:\n{passages}\n\n"
+            f"QUESTION: {question}\n\n"
+            f"RULES: {_lang_hint()} Keep it short, clear, and fun. "
+            f"If the answer isn’t in the excerpts, say you aren’t sure."
+        )
+        try:
+            ans = ask_gemini(prompt).strip()
+            if ans:
+                return ans
+        except Exception:
+            pass
+        if client:
+            try:
+                resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"user","content":prompt}],
+                    temperature=0.4, max_tokens=220
+                )
+                ans = (resp.choices[0].message.content or "").strip()
+                if ans:
+                    return ans
+            except Exception:
+                pass
+
+    return ask_with_context(question, category, age)
+
 # ===== Onboarding: name -> age -> ask ========================================
 def name_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
@@ -488,6 +566,10 @@ def name_step():
         st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
+def _age_chip(n: int):
+    g1, g2 = random.choice(ALPHA_COLORS)
+    st.markdown(f"<div class='age-chip' style='--g1:{g1};--g2:{g2}'>{n}</div>", unsafe_allow_html=True)
+
 def age_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
     st.subheader(tr("🎂 How old are you?","🎂 كم عمرك؟"))
@@ -496,13 +578,9 @@ def age_step():
     picked = None
     for i, n in enumerate(range(1,11)):
         with row[i]:
-            g1, g2 = random.choice(ALPHA_COLORS)
-            st.markdown(f"<div class='age-tile'>"
-                        f"<span class='age-chip' style='--g1:{g1};--g2:{g2}'>{n}</span>",
-                        unsafe_allow_html=True)
-            if st.button(str(n), key=f"age_{n}", help=tr("Select age","اختر العمر")):
+            _age_chip(n)
+            if st.button(str(n), key=f"age_{n}"):
                 picked = n
-            st.markdown("</div>", unsafe_allow_html=True)
     if picked is not None:
         st.session_state["kid_age"] = picked
         st.session_state["age_compliments_list"] = AGE_COMPLIMENTS_3.get(picked, [tr("🎈 Awesome age!","🎈 عمر رائع!")])
@@ -538,7 +616,7 @@ def render_category_picker():
                     f"</div>",
                     unsafe_allow_html=True
                 )
-                if st.button((tr("Choose","اختر") + f" {k}"), key=f"choose_{k}", use_container_width=True):
+                if st.button((tr("Choose","اختر") + f" {k}"), key=f"choose_{k}"):
                     st.session_state["topic_category"] = k
                     st.rerun()
 
@@ -647,7 +725,7 @@ def ask_step():
                                  value=default_q, key="ask_input")
     else:
         question = st.text_input(tr("❓ What do you want to ask?","❓ ما الذي تريد سؤاله؟"), key="ask_input")
-    audio_bytes, _ = audio_input_ui()
+    audio_bytes, src = audio_input_ui()
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
         with st.spinner(tr("Transcribing…","جاري التفريغ الصوتي…")):
@@ -664,7 +742,11 @@ def ask_step():
             if not question.strip():
                 st.info(tr("Please type a question or use the mic/uploader.","من فضلك اكتب سؤالاً أو استخدم الميكروفون/الرفع."))
             else:
-                answer = answer_with_book_then_ai(question.strip(), st.session_state.get("topic_category"), age)
+                answer = answer_kid_question_with_book_first(
+                    question.strip(),
+                    st.session_state.get("topic_category"),
+                    age
+                )
                 st.session_state["last_answer"] = answer
                 st.session_state["last_question"] = question.strip()
                 st.session_state["just_answered"] = True
@@ -725,7 +807,7 @@ def ask_step():
                     st.error(tr("Couldn't send email ❌","تعذّر إرسال البريد ❌")); st.code(msg, language="text")
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ===== NEON THEME (for Neon UI tab usage) ====================================
+# ===== NEON THEME =============================================================
 NEON_CSS = """
 <style>
 :root{ --neon:#3DF0A5; --neon2:#5BB9FF; --bg:#020617; --glass: rgba(15,23,42,.55);
@@ -757,7 +839,7 @@ NEON_CSS = """
 .neon-send button{ width:64px; height:44px; border-radius:12px; border:2px solid rgba(61,240,165,.55)!important;
   background:linear-gradient(180deg, rgba(61,240,165,.25), rgba(91,185,255,.20))!important; color:#0d1b2a!important;
   font-weight:900; box-shadow:0 0 18px rgba(61,240,165,.28); }
-.small{font-size:12px;color:var(--dim")}
+.small{font-size:12px;color:var(--dim)}
 </style>
 """
 
@@ -790,7 +872,7 @@ def render_neon_chat_ui():
     if send and q.strip():
         st.session_state.neon_chat.append(("user", q.strip()))
         try:
-            ans = answer_with_book_then_ai(q.strip(), st.session_state.get("topic_category"), age)
+            ans = answer_kid_question_with_book_first(q.strip(), st.session_state.get("topic_category"), age)
         except Exception:
             ans = tr("Sorry, couldn't answer right now.","عذراً، لا أستطيع الإجابة الآن.")
         st.session_state.neon_chat.append(("bot", ans))
@@ -800,71 +882,65 @@ def render_neon_chat_ui():
         st.rerun()
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ===== Book Library (NEW) =====================================================
-def render_book_library_tab():
-    st.title(tr("📖 Book Library", "📖 مكتبة الكتب"))
-    books = list_books()
-    active = get_active_book_id()
-    if not books:
-        st.info(tr("No books saved yet. Go to 'Learning Book' to upload one.",
-                   "لا توجد كتب محفوظة بعد. اذهب إلى 'كتاب التعلم' لرفع كتاب."))
-        return
-    cols = st.columns([2, 1, 1, 1])
-    cols[0].markdown("**" + tr("Title", "العنوان") + "**")
-    cols[1].markdown("**" + tr("Chunks", "المقاطع") + "**")
-    cols[2].markdown("**" + tr("Active", "مفعل") + "**")
-    cols[3].markdown("**" + tr("Actions", "إجراءات") + "**")
-    for b in books:
-        c = st.columns([2, 1, 1, 1])
-        c[0].write(b["title"])
-        c[1].write(b["num_chunks"])
-        is_active = (b["id"] == active)
-        c[2].write("✅" if is_active else "")
-        activate = c[3].button(tr("Use", "استخدم"), key=f"use_{b['id']}")
-        delete = c[3].button(tr("Delete", "حذف"), key=f"del_{b['id']}")
-        if activate:
-            set_active_book_id(b["id"])
-            st.success(tr("This book is now active for Q&A.","تم تفعيل هذا الكتاب للإجابة على الأسئلة."))
-            st.rerun()
-        if delete:
-            delete_book(b["id"])
-            st.warning(tr("Book deleted.","تم حذف الكتاب."))
-            st.rerun()
-    st.divider()
-    if active:
-        meta = load_book(active)
-        st.success(tr(f"Active book: {meta.get('title','')}",
-                      f"الكتاب المفعّل: {meta.get('title','')}"))
-        sample = "\n\n".join(meta.get("chunks", [])[:2])
-        with st.expander(tr("Preview first pages (chunks)", "عرض أول المقاطع")):
-            st.write(sample or tr("No preview", "لا يوجد معاينة"))
-
-# ===== Learning Book (upload + add to library) ================================
+# ===== PDF Learning Book (Arabic/English) =====================================
 def render_learning_book_tab_local():
-    st.title(tr("📚 Learning Book","📚 كتاب التعلم"))
-    st.write(tr("Upload a PDF (English/Arabic). We'll index it for Q&A and add it to your library.",
-                "ارفع ملف PDF (عربي/إنجليزي). سنفهرسه للإجابة ونضيفه إلى مكتبتك."))
-    title = st.text_input(tr("Book title (for the library)", "عنوان الكتاب (للمكتبة)"))
+    st.write(tr("Upload a PDF book (English or Arabic). We'll search it first before using AI.",
+               "ارفع كتاب PDF (عربي أو إنجليزي). سنبحث فيه أولاً قبل استخدام الذكاء الاصطناعي."))
     file = st.file_uploader(tr("Choose a PDF", "اختر ملف PDF"), type=["pdf"])
     if file is not None:
         with st.spinner(tr("Extracting text…","جاري استخراج النص…")):
             pdf_bytes = file.read()
-            txt, used_ocr = extract_text_from_pdf(pdf_bytes, get_lang())
-        if len(txt.strip()) < 30:
-            if used_ocr and not _ocr_available():
-                st.warning(tr(
-                    "I couldn't read enough text. Your PDF looks scanned. Install: pytesseract, pdf2image, and system tools (tesseract-ocr + poppler).",
-                    "لم أستطع قراءة نص كافٍ. يبدو أن ملفك ممسوح ضوئياً. ثبّت: pytesseract و pdf2image وأدوات النظام (tesseract-ocr و poppler)."
-                ))
-            else:
-                st.warning(tr("Couldn't extract much text from this PDF.","تعذّر استخراج نص كافٍ من هذا الملف."))
-        else:
-            book_id = save_book(title or file.name, get_lang(), txt)
-            set_active_book_id(book_id)
-            st.success(tr(
-                "Book indexed and added to the library. It's active now.",
-                "تم فهرسة الكتاب وإضافته للمكتبة. وهو مفعّل الآن."
+            txt, method = robust_extract_text(pdf_bytes, get_lang())
+        if len(normalize_arabic(txt)) < 200:
+            st.warning(tr(
+                "I couldn't read enough text from this PDF. If it is scanned, we enabled OCR on the server, but some files still need higher quality.",
+                "تعذّر استخراج نص كافٍ من هذا الملف. إذا كان ممسوحاً ضوئياً فقد تحتاج لنسخة أوضح."
             ))
+        else:
+            st.success(tr(f"Book loaded using: {method}", f"تم تحميل الكتاب بطريقة: {method}"))
+            st.session_state["learning_book_text"] = txt
+            # Build/refresh an embedding index for this book
+            st.session_state["book_index"] = LocalBookIndex()
+            st.session_state["book_index"].build(txt)
+            st.session_state["active_book_name"] = file.name
+
+    book_text = st.session_state.get("learning_book_text","")
+    if book_text:
+        q = st.text_input(tr("Ask about the book:","اسأل عن الكتاب:"))
+        if st.button(tr("🔎 Answer from book","🔎 أجب من الكتاب")):
+            if not q.strip():
+                ans = tr("Please type a question.","من فضلك اكتب سؤالاً.")
+            else:
+                passages = st.session_state["book_index"].search_text(q, top_k=6)
+                if passages.strip():
+                    prompt = (f"Use these passages to answer the child's question.\n\n"
+                              f"{passages}\n\n"
+                              f"Q: {q}\n\n{_lang_hint()} Keep it short and friendly.")
+                    try:
+                        ans = ask_gemini(prompt)
+                    except Exception:
+                        if client:
+                            try:
+                                resp = client.chat.completions.create(
+                                    model="gpt-4o-mini",
+                                    messages=[{"role":"user","content":prompt}],
+                                    temperature=0.4, max_tokens=220
+                                )
+                                ans = (resp.choices[0].message.content or "").strip()
+                            except Exception as e:
+                                ans = tr(f"Book QA error: {e}", f"خطأ في سؤال الكتاب: {e}")
+                        else:
+                            ans = tr("Sorry, I couldn't answer right now.", "عذراً، لا أستطيع الإجابة الآن.")
+                else:
+                    ans = tr("I'm not sure. The text seems unrelated or too short.",
+                             "لست متأكداً. يبدو أن النص غير متعلق أو قصير جداً.")
+            st.markdown(tr("#### Answer","#### الإجابة"))
+            st.success(ans)
+            if st.button(tr("🔊 Read Aloud","🔊 قراءة بصوت عالٍ")):
+                try:
+                    st.audio(tts_gtts_bytes(ans, lang=get_lang()), format="audio/mp3")
+                except Exception as e:
+                    st.error(f"TTS error: {e}")
 
 # ========================= MAIN TABS ==========================================
 if tab == tr("💬 Ask DAD AI", "💬 اسأل بابا الذكي"):
@@ -877,14 +953,10 @@ if tab == tr("💬 Ask DAD AI", "💬 اسأل بابا الذكي"):
     else:
         if "child_name" not in st.session_state:
             st.session_state["child_name"] = (st.session_state.get("kid_name","") or tr("Kid","طفل")).strip()
-        # You can switch to render_neon_chat_ui() if you prefer Neon
-        ask_step()
-
-elif tab == tr("📖 Book Library", "📖 مكتبة الكتب"):
-    render_book_library_tab()
-
-elif tab == tr("📚 Learning Book", "📚 كتاب التعلم"):
-    render_learning_book_tab_local()
+        if ui_style == "Neon":
+            render_neon_chat_ui()
+        else:
+            ask_step()
 
 elif tab == tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"):
     st.title(tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"))
@@ -916,6 +988,10 @@ elif tab == tr("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"):
         else: st.error(tr("Test email failed ❌","فشل إرسال الرسالة ❌")); st.code(msg, language="text")
     render_dashboard_tab()
 
+elif tab == tr("📚 Learning Book", "📚 كتاب التعلم"):
+    st.title(tr("📚 Learning Book","📚 كتاب التعلم"))
+    render_learning_book_tab_local()
+
 elif tab == tr("🧠 Quiz Fun", "🧠 مسابقة ممتعة"):
     st.title(tr("🧠 Quiz Fun","🧠 مسابقة ممتعة"))
     st.write(tr("Answer fun questions and get stars!","أجب عن أسئلة ممتعة واحصل على نجوم!"))
@@ -940,7 +1016,8 @@ elif tab == tr("🧠 Quiz Fun", "🧠 مسابقة ممتعة"):
                 st.rerun()
         else:
             st.subheader(q["question"])
-            labeled = alpha_labels(q["choices"])
+            # Colorful alphabet-style radio labels
+            labeled = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q["choices"])]
             choice = st.radio(tr("Pick one:","اختر واحدة:"), labeled, key=f"quiz_choice_{st.session_state.quiz_q_index}")
             if st.button(tr("✅ Submit","✅ أرسل")):
                 idx = labeled.index(choice)
