@@ -6,6 +6,7 @@ audio-recorder-streamlit
 streamlit-drawable-canvas
 google-generativeai
 requests
+sentence-transformers
 
 # PDF extraction
 pymupdf
