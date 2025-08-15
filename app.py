@@ -382,12 +382,21 @@ def age_step():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
     st.subheader(tr("🎂 How old are you?","🎂 كم عمرك؟"))
     st.caption(tr("Tap one","اختر عمرك"))
+
+    # Colorful alphabet‑style age chips (1..10)
     row = st.columns(10)
     picked = None
-    for i, n in enumerate(range(1,11)):
+    for i, n in enumerate(range(1, 11)):
+        g1, g2 = random.choice(ALPHA_COLORS)
+        chip_html = f"<span class='alpha-chip' style='--g1:{g1};--g2:{g2}'>{n}</span>"
         with row[i]:
-            if st.button(str(n), key=f"age_{n}"):
+            if st.button(chip_html, key=f"age_{n}", help=str(n), use_container_width=True):
                 picked = n
+            st.markdown(
+                f"<div style='text-align:center;font-weight:900;color:#0b1324;opacity:.85'>{n}</div>",
+                unsafe_allow_html=True
+            )
+
     if picked is not None:
         st.session_state["kid_age"] = picked
         st.session_state["age_compliments_list"] = AGE_COMPLIMENTS_3.get(picked, [tr("🎈 Awesome age!","🎈 عمر رائع!")])
@@ -395,6 +404,7 @@ def age_step():
         st.session_state["age_celebrate_msg"] = "age_ready"
         st.session_state["onboarding_step"] = "ask"
         st.rerun()
+
     name = st.session_state.get("child_name", tr("Kid","طفل"))
     st.markdown(f"<div class='wave'>{tr('Hi,','مرحباً،')} {html.escape(name)}!</div>", unsafe_allow_html=True)
     st.markdown(bubble_name_html(name), unsafe_allow_html=True)
@@ -450,7 +460,7 @@ def _explain_three_ways(base_q: str, base_a: str, age: int | None, category: str
             pass
         if client:
             try:
-                resp = client.chat.completions.create(
+                resp = client.chat_completions.create(  # NOTE: old SDKs use chat.completions; keep yours if needed
                     model="gpt-4o-mini",
                     messages=[{"role":"user","content":prompt}],
                     temperature=0.5, max_tokens=220
@@ -704,10 +714,10 @@ def _extract_text_pymupdf(file_bytes: bytes) -> str:
 
 def _extract_text_pdfminer(file_bytes: bytes) -> str:
     try:
-        from pdfminer.high_level import extract_text
+        from pdfminer_high_level import extract_text  # fallback name
     except Exception:
         try:
-            from pdfminer_high_level import extract_text
+            from pdfminer.high_level import extract_text
         except Exception:
             return ""
     try:
@@ -732,7 +742,6 @@ def _extract_text_ocr(file_bytes: bytes, lang: str) -> str:
     except Exception:
         return ""
     try:
-        # Optional: honor POPPLER_PATH env if needed on Windows/macOS
         poppler_path = os.getenv("POPPLER_PATH")
         pages = convert_from_bytes(file_bytes, poppler_path=poppler_path) if poppler_path else convert_from_bytes(file_bytes)
         tess_lang = "ara" if lang.startswith("ar") else "eng"
@@ -871,7 +880,7 @@ elif tab == tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"):
                                  "صف رسمة تريدها (مثلاً: 'أسد صغير لطيف مع تاج')"))
         if st.button(tr("🎨 Generate Cute Drawing (Stability)","🎨 أنشئ رسمة لطيفة (Stability)")):
             img_bytes = generate_drawing_with_stability(prompt)
-            if img_bytes: st.image(img_bytes, caption=tr("Generated Art","صورة مولّدة"), use_container_width=True)
+            if img_bytes: st.image(img_bytes, caption=tr("Generated Art","صورة مولّدة"), use_column_width=True)
             else: st.warning(tr("Couldn't generate drawing (check STABILITY_API_KEY in your .env).",
                                "تعذّر توليد الرسمة (تحقّق من STABILITY_API_KEY في ملف .env)."))
 
@@ -961,6 +970,6 @@ elif tab == tr("🎨 Draw & Guess (Gemini)", "🎨 ارسم وخمّن (Gemini)"
         if col2.button(tr("📷 Show real photo","📷 عرض صورة حقيقية")):
             with st.spinner(tr("Finding a photo...","جاري العثور على صورة...")):
                 url = fetch_animal_photo(guess.get("animal",""))
-            if url: st.image(url, caption=tr("Real photo","صورة حقيقية"), use_container_width=True)
+            if url: st.image(url, caption=tr("Real photo","صورة حقيقية"), use_column_width=True)
             else: st.warning(tr("Couldn't find a photo right now. Try another animal or check your internet.",
                                "تعذّر العثور على صورة الآن. جرّب حيواناً آخر أو تحقّق من الإنترنت."))
