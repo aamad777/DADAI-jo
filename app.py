@@ -1,4 +1,5 @@
 # app.py — Ask DAD AI (Arabic + Neon + Robust PDF + Alpha Lists + Book Library)
+from rag_arabic import robust_extract_text, LocalBookIndex, normalize_arabic
 import os, json, threading, queue, random, html, tempfile
 from datetime import datetime
 from io import BytesIO
