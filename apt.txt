@@ -4,3 +4,5 @@ poppler-utils
 ocrmypdf
 libgl1
 fonts-dejavu-core
+fonts-noto
+
