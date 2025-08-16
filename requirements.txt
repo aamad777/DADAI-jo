@@ -7,6 +7,7 @@ streamlit-drawable-canvas
 google-generativeai
 requests
 sentence-transformers
+torch
 
 # PDF extraction
 pymupdf
