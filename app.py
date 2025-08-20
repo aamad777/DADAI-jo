@@ -1,110 +1,142 @@
-# app.py — Ask DAD AI with Classic/Neon UI, Arabic support, Robust PDF OCR, Book-first QA,
-# and a persistent BOOK STORE tab (upload, list, use, delete, preview).
-
-import os, json, threading, queue, random, html, tempfile, re, shutil, datetime
+# app.py — DAD AI (Arabic + English + Book Store + Name Meaning + Kid Hero)
+import os, re, json, random, html, tempfile, shutil, io, threading, queue, base64
 from io import BytesIO
-from typing import List, Tuple
+from datetime import datetime
+from pathlib import Path
 
+import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
 
-# Optional mic widget
+# ====== Optional mic widget ======
 try:
     from audio_recorder_streamlit import audio_recorder
     HAS_AUDIO_RECORDER = True
 except Exception:
     HAS_AUDIO_RECORDER = False
 
-# Project modules already present in your repo
-from drawing import generate_drawing_with_stability
-from sound import play_animal_sound
-from dashboard import render_dashboard_tab
-from kid_feedback import send_email_to_dad
-from quiz_game import get_quiz_question
-from quiz_sounds import play_correct_sound, play_wrong_sound, play_win_sound
-from quiz_scoreboard import log_score, show_scoreboard
-from streamlit_drawable_canvas import st_canvas
-from gemini_ai import classify_sketch, fetch_animal_photo, ask_gemini
+# ====== AI Clients (Gemini + OpenAI) ======
+import google.generativeai as genai
+from openai import OpenAI
 
-# ----------------- Config & env
+# ====== PDF & OCR ======
+import fitz  # PyMuPDF
+from pdfminer.high_level import extract_text as pdfminer_extract
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    OCR_OK = True
+except Exception:
+    OCR_OK = False
+
+# ====== Embeddings ======
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ====== Misc ======
+from PIL import Image
+
+# ------------------------------------------------------------------------------
+# Load env
+# ------------------------------------------------------------------------------
 load_dotenv()
-openai_api_key = os.getenv("OPENAI_API_KEY", "")
-client = OpenAI(api_key=openai_api_key) if openai_api_key else None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-BOOK_DIR = "books"  # persistent shelf
-os.makedirs(BOOK_DIR, exist_ok=True)
+# ------------------------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------------------------
+ROOT = Path(__file__).parent
+BOOKS_DIR = ROOT / "books"       # persistent store for uploaded books
+BOOKS_DIR.mkdir(exist_ok=True)
 
-# ===== Language & helpers
+# ------------------------------------------------------------------------------
+# Language helpers
+# ------------------------------------------------------------------------------
 LANGS = {"English": "en", "العربية": "ar"}
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "en"
 
-def init_lang_state():
-    if "lang" not in st.session_state:
-        st.session_state["lang"] = "en"
-init_lang_state()
-
-def get_lang() -> str:
+def get_lang():
     return st.session_state.get("lang", "en")
 
-def is_ar() -> bool:
+def is_ar():
     return get_lang().startswith("ar")
 
-def tr(en: str, ar: str) -> str:
+def tr(en, ar):
     return ar if is_ar() else en
 
-def slugify(name: str) -> str:
-    s = re.sub(r"[^\w\s\-]+", "", name).strip().lower()
-    s = re.sub(r"\s+", "_", s)
-    return s or f"book_{random.randint(1000,9999)}"
+def _lang_hint():
+    return "Respond in Arabic (Modern Standard Arabic) with very simple words." if is_ar() \
+           else "Respond in English with very simple words."
 
-# ===== TTS (gTTS)
+# ------------------------------------------------------------------------------
+# TTS (gTTS)
+# ------------------------------------------------------------------------------
 def tts_gtts_bytes(text: str, lang: str = "en", slow: bool = False) -> bytes:
     if not text:
         return b""
-    from gtts import gTTS
+    try:
+        from gtts import gTTS
+    except ImportError as e:
+        raise ImportError("gTTS is not installed. Add gTTS to requirements.") from e
     mp3_fp = BytesIO()
     gTTS(text=text, lang=lang, slow=slow).write_to_fp(mp3_fp)
     return mp3_fp.getvalue()
 
-# ===== STT (Whisper or Google)
+# ------------------------------------------------------------------------------
+# STT (Whisper first, then Google SR with timeout)
+# ------------------------------------------------------------------------------
 STT_TIMEOUT_SECS = 10
+
 def _google_stt_worker(audio_bytes: bytes, out_q: "queue.Queue[tuple[str|None, str|None]]"):
     try:
         import speech_recognition as sr
         r = sr.Recognizer()
+        r.dynamic_energy_threshold = True
+        r.energy_threshold = 300
         with sr.AudioFile(BytesIO(audio_bytes)) as source:
             audio = r.record(source)
-        lang_code = "ar" if is_ar() else "en-US"
+        lang_code = "ar-SA" if is_ar() else "en-US"
         text = r.recognize_google(audio, language=lang_code)
         out_q.put((text, None))
     except Exception as e:
         out_q.put((None, f"STT failed: {e}"))
 
 def transcribe_audio(audio_bytes: bytes):
-    if os.getenv("OPENAI_API_KEY"):
+    # Whisper first
+    if OPENAI_API_KEY:
         try:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-            tmp.write(audio_bytes); tmp.flush(); tmp.close()
-            client_local = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            with open(tmp.name, "rb") as f:
-                resp = client_local.audio.transcriptions.create(model="whisper-1", file=f)
-            text = (resp.text or "").strip()
-            if text: return text, None
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                tmp.write(audio_bytes)
+                tmp.flush()
+                tmp_path = tmp.name
+            with open(tmp_path, "rb") as f:
+                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+            os.unlink(tmp_path)
+            if resp and getattr(resp, "text", ""):
+                return resp.text.strip(), None
         except Exception:
             pass
+    # Google fallback (thread + timeout)
     out_q: "queue.Queue[tuple[str|None, str|None]]" = queue.Queue(maxsize=1)
     t = threading.Thread(target=_google_stt_worker, args=(audio_bytes, out_q), daemon=True)
     t.start(); t.join(STT_TIMEOUT_SECS)
     if t.is_alive():
-        return None, f"STT timed out after {STT_TIMEOUT_SECS}s."
+        return None, tr(f"STT timed out after {STT_TIMEOUT_SECS}s.", f"انتهت مهلة تحويل الصوت بعد {STT_TIMEOUT_SECS}ث.")
     try:
         text, err = out_q.get_nowait()
         return text, err
     except queue.Empty:
-        return None, "STT failed unexpectedly."
+        return None, tr("STT failed unexpectedly.", "تعذّر التحويل الصوتي بشكل غير متوقع.")
 
-# ===== Styling
-st.set_page_config(page_title="Ask DAD AI", layout="wide")
+# ------------------------------------------------------------------------------
+# Styles (kids buttons + colorful A/B/C + colorful number chips)
+# ------------------------------------------------------------------------------
+st.set_page_config(page_title="DAD AI", layout="wide")
 st.markdown("""
 <style>
 .kids-ui .stButton>button, .kids-ui [data-testid="stButton"]>button {
@@ -119,32 +151,43 @@ st.markdown("""
 @keyframes kidsRainbow { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
 
 .name-bubbles { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px; }
-.bubble { display:inline-block; padding:.26rem .52rem; border-radius:12px; color:#0b1324; font-weight:900;
-  background: radial-gradient(circle at 30% 20%, var(--c1), var(--c2)); box-shadow: 0 6px 14px rgba(0,0,0,0.12);
-  transform: translateY(12px) scale(.9); opacity:0; animation: popIn .5s ease forwards; animation-delay: var(--d);
-  border: 2px solid rgba(255,255,255,.5); }
+.bubble {
+  display:inline-block; padding:.26rem .52rem; border-radius:12px;
+  color:#0b1324; font-weight:900; letter-spacing:.5px; line-height:1;
+  background: radial-gradient(circle at 30% 20%, var(--c1), var(--c2));
+  box-shadow: 0 6px 14px rgba(0,0,0,0.12);
+  transform: translateY(12px) scale(.9); opacity:0;
+  animation: popIn .5s ease forwards; animation-delay: var(--d);
+  border: 2px solid rgba(255,255,255,.5);
+}
 @keyframes popIn { to { transform: translateY(0) scale(1); opacity:1; } }
 
-.wave { font-size: 42px; font-weight: 900; letter-spacing: 1px; margin: 6px 0 4px 0;
+.wave {
+  font-size: 42px; font-weight: 900; letter-spacing: 1px; margin: 6px 0 4px 0;
   background: linear-gradient(90deg,#22c55e,#06b6d4,#a78bfa,#f97316);
-  -webkit-background-clip: text; background-clip: text; color: transparent; animation: hue 6s linear infinite;}
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: hue 6s linear infinite;
+}
 @keyframes hue { 0%{filter:hue-rotate(0deg)} 100%{filter:hue-rotate(360deg)} }
 
-.compliment-row { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 2px 0; }
-.comp-chip { display:inline-flex; align-items:center; gap:8px; padding:10px 12px; border-radius:14px;
-  background:linear-gradient(135deg,#e9d5ff,#bfdbfe); color:#0b1324; font-weight:900;
-  box-shadow:0 8px 16px rgba(0,0,0,.08); border:1.5px solid rgba(255,255,255,.6); }
-
-.alpha-chip, .age-chip {
+.alpha-chip {
   display:inline-flex; align-items:center; justify-content:center;
-  width:28px; height:28px; border-radius:50%; font-weight:900; color:#0b1324;
+  width:28px; height:28px; border-radius:50%;
+  margin-right:8px; font-weight:900; color:#0b1324;
   background: linear-gradient(135deg,var(--g1),var(--g2));
-  box-shadow:0 4px 10px rgba(0,0,0,.12); margin-bottom:6px;
+  box-shadow:0 4px 10px rgba(0,0,0,.12);
 }
 .alpha-row { display:flex; align-items:flex-start; gap:8px; margin:6px 0; }
+.number-chip {
+  display:inline-flex; align-items:center; justify-content:center;
+  width:32px; height:32px; border-radius:50%; margin: 4px; font-weight:900;
+  color:#0b1324; background:linear-gradient(135deg,#fef3c7,#fdba74);
+  box-shadow:0 4px 10px rgba(0,0,0,.12); border:2px solid rgba(255,255,255,.6);
+}
 </style>
 """, unsafe_allow_html=True)
 
+# RTL tweaks
 if is_ar():
     st.markdown("""
     <style>
@@ -154,116 +197,421 @@ if is_ar():
     </style>
     """, unsafe_allow_html=True)
 
-# ===== Sidebar
-st.sidebar.title("📚 DAD AI Navigation")
-lang_choice = st.sidebar.selectbox("Language / اللغة", list(LANGS.keys()),
+# ------------------------------------------------------------------------------
+# Sidebar (language + tabs)
+# ------------------------------------------------------------------------------
+st.sidebar.title("📚 DAD AI")
+lang_choice = st.sidebar.selectbox(tr("Language","اللغة"), list(LANGS.keys()),
                                    index=0 if get_lang()=="en" else 1)
 st.session_state["lang"] = LANGS[lang_choice]
 
-tab = st.sidebar.radio(tr("Choose a tab:", "اختر صفحة:"),
-    [
-        tr("💬 Ask DAD AI", "💬 اسأل بابا الذكي"),
-        tr("🏪 Book Store", "🏪 مكتبة الكتب"),
-        tr("📚 Learning Book", "📚 كتاب التعلم"),
-        tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"),
-        tr("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"),
-        tr("🧠 Quiz Fun", "🧠 مسابقة ممتعة"),
-        tr("📊 Scoreboard", "📊 لوحة النتائج"),
-        tr("🎨 Draw & Guess (Gemini)", "🎨 ارسم وخمّن (Gemini)"),
-    ]
-)
-ui_style = st.sidebar.selectbox(tr("🎨 UI style", "🎨 نمط الواجهة"), ["Classic", "Neon"], index=0)
+TABS = [
+    tr("💬 Ask DAD AI","💬 اسأل بابا الذكي"),
+    tr("📚 Learning Book","📚 كتاب التعلم"),
+    tr("📚 Book Store (choose & manage)","📚 مخزن الكتب (اختيار وإدارة)"),
+    tr("🐾 Animal Fun","🐾 مرح مع الحيوانات"),
+    tr("🧠 Quiz Fun","🧠 مسابقة ممتعة"),
+    tr("📊 Scoreboard","📊 النتائج"),
+    tr("🎨 Draw & Guess","🎨 ارسم وخمّن"),
+]
+tab = st.sidebar.radio(tr("Choose a tab:","اختر صفحة:"), TABS, index=0)
 
-# ===== Utilities / data helpers
-def load_answers():
-    try:
-        with open("answers.json","r",encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_qa_log(name, question, answer):
-    entry = {"name":name,"question":question,"answer":answer,"ts":datetime.datetime.utcnow().isoformat()+"Z"}
-    try:
-        data = json.load(open("qa_log.json","r",encoding="utf-8")) if os.path.exists("qa_log.json") else []
-    except Exception:
-        data = []
-    data.append(entry)
-    json.dump(data, open("qa_log.json","w",encoding="utf-8"), ensure_ascii=False, indent=2)
-
-# ===== Categories + compliments
-CATEGORIES = {
-    "Math": {"emoji": "➗", "colors": ("#fde68a", "#fca5a5"),
-             "ideas": ["What is zero?", "What is 7 + 3?", "Why are triangles special?"]},
-    "Science": {"emoji": "🔬", "colors": ("#bbf7d0", "#93c5fd"),
-                "ideas": ["Why is the sky blue?", "What is gravity?", "How do plants drink water?"]},
-    "Space": {"emoji": "🚀", "colors": ("#c7d2fe", "#93c5fd"),
-              "ideas": ["What is a black hole?", "Why do stars twinkle?", "How big is the Sun?"]},
-    "History": {"emoji": "🏛️", "colors": ("#fef3c7", "#fdba74"),
-                "ideas": ["Who built the pyramids?", "Who was the first pilot?", "What is a castle?"]},
-    "Animals": {"emoji": "🐼", "colors": ("#86efac", "#a7f3d0"),
-                "ideas": ["Why do cats purr?", "How do bees make honey?", "Do elephants swim?"]},
-    "Geography": {"emoji": "🗺️", "colors": ("#bae6fd", "#93c5fd"),
-                  "ideas": ["Where does rain come from?", "What is a volcano?", "What is a desert?"]},
-    "Art": {"emoji": "🎨", "colors": ("#fbcfe8", "#fda4af"),
-            "ideas": ["What are primary colors?", "What is a portrait?", "How do you mix green?"]},
-    "Sports": {"emoji": "⚽", "colors": ("#d1fae5", "#a7f3d0"),
-               "ideas": ["How big is a soccer field?", "What is offside?", "Why do we warm up?"]},
-}
-AGE_COMPLIMENTS_3 = {i: [tr("🎈 Awesome age!","🎈 عمر رائع!")] for i in range(1,11)}
-
-# ===== Color helpers
+# ------------------------------------------------------------------------------
+# Helpers: name bubbles & colorful A/B/C steps
+# ------------------------------------------------------------------------------
+BUBBLE_COLORS = [
+    ("#a7f3d0", "#86efac"), ("#93c5fd", "#bfdbfe"), ("#fbcfe8", "#fda4af"),
+    ("#fde68a", "#fca5a5"), ("#c7d2fe", "#93c5fd"), ("#fdba74", "#fef3c7"),
+]
 ALPHA_COLORS = [
     ("#fde68a","#fca5a5"), ("#bbf7d0","#86efac"), ("#c7d2fe","#93c5fd"),
     ("#fbcfe8","#fda4af"), ("#bae6fd","#93c5fd"), ("#d1fae5","#a7f3d0"),
 ]
+def bubble_name_html(name: str) -> str:
+    if not name.strip():
+        return "<div class='name-bubbles'> </div>"
+    spans = []
+    for i, ch in enumerate(name.strip()):
+        c1, c2 = random.choice(BUBBLE_COLORS)
+        delay = f"{0.05*i:.2f}s"
+        safe = html.escape(ch.upper())
+        spans.append(f"<span class='bubble' style='--c1:{c1};--c2:{c2};--d:{delay}'>{safe}</span>")
+    return "<div class='name-bubbles'>" + "".join(spans) + "</div>"
+
 def render_alpha_steps(text_block: str):
-    if not text_block.strip(): return
+    if not text_block.strip():
+        return
     lines = [ln.strip() for ln in text_block.splitlines() if ln.strip()]
     cleaned = []
     for ln in lines:
-        ln = ln.lstrip("-•*").strip()
-        while len(ln) > 1 and (ln[0].isdigit() or ln[0].isalpha()) and ln[1] in [")", ".", "］", "】", "）", "．"]:
-            ln = ln[2:].strip()
+        ln = re.sub(r"^[\-\*\d]+\s*[)\.．】）］]?\s*", "", ln).strip()
         cleaned.append(ln)
     for i, ln in enumerate(cleaned):
         g1, g2 = random.choice(ALPHA_COLORS)
         chip = f"<span class='alpha-chip' style='--g1:{g1};--g2:{g2}'>{chr(65+i)}</span>"
         st.markdown(f"<div class='alpha-row'>{chip}<div>{html.escape(ln)}</div></div>", unsafe_allow_html=True)
 
-# ===== Model wrapper
-def _lang_hint():
-    return "Respond in Arabic (Modern Standard Arabic) with very simple words." if is_ar() \
-           else "Respond in English with very simple words."
+def number_chip(n: int) -> str:
+    return f"<span class='number-chip'>{n}</span>"
 
-def ask_with_context(question: str, category: str | None, age: int | None) -> str:
-    answers = load_answers()
-    for k, v in answers.items():
-        if k.lower() in question.lower():
-            return v
-    topic = category or "General"
-    age_text = f"{age}" if age else tr("kid","طفل")
-    system = f"Answer like a kind teacher for a child age {age_text}. Topic: {topic}. {_lang_hint()} Keep it short."
+# ------------------------------------------------------------------------------
+# Name meaning + Kid hero
+# ------------------------------------------------------------------------------
+NAME_MEANINGS = {
+    "en": {
+        "adam": "Means 'earth'—a classic name.",
+        "lina": "Means 'tender' or 'gentle'.",
+        "maya": "Often linked to 'water' or 'magic'.",
+        "omar": "Means 'long-lived' or 'prosperous'.",
+        "sara": "Means 'joy' or 'princess'.",
+        "ziad": "Means 'growth' or 'abundance'.",
+    },
+    "ar": {
+        "آدم": "يعني «الأرض» — اسم عريق.",
+        "لينا": "يعني «الرفيقة اللطيفة».",
+        "مايا": "يرتبط بالماء أو السحر.",
+        "عمر": "يعني «طويل العمر» أو «مزدهر».",
+        "سارة": "يعني «الفرح» أو «الأميرة».",
+        "زياد": "يعني «النماء» أو «الزيادة».",
+    }
+}
+def _normalize_name(n: str) -> str:
+    return (n or "").strip().lower()
+
+def lookup_name_meaning_local(name: str) -> str | None:
+    if is_ar():
+        return NAME_MEANINGS["ar"].get(name.strip()) or None
+    key = _normalize_name(name)
+    return NAME_MEANINGS["en"].get(key)
+
+def lookup_name_meaning_ai(name: str) -> str:
+    prompt = (
+        f"{_lang_hint()} Give a kind, super-short meaning or origin of the given first name. "
+        f"One sentence only. Name: {name}"
+    )
     try:
-        return ask_gemini(f"{system}\nQuestion: {question}")
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        out = model.generate_content(prompt)
+        txt = (getattr(out, "text", "").strip() or "").strip()
+        if txt:
+            return txt
     except Exception:
         pass
     if client:
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role":"system","content":system},{"role":"user","content":question}],
-                temperature=0.4, max_tokens=180
+                messages=[{"role":"user","content":prompt}],
+                temperature=0.2, max_tokens=48
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception:
+            pass
+    return tr("A lovely name!","اسم جميل!")
+
+KID_HEROES = [
+    {
+        "name_en": "Nurse", "name_ar": "الممرّضة",
+        "img": "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6d/Cartoon_nurse.svg/512px-Cartoon_nurse.svg.png",
+        "fact_en": "Heroes who care for people and give them medicine.",
+        "fact_ar": "أبطال يعتنون بالناس ويقدّمون الدواء.",
+    },
+    {
+        "name_en": "Firefighter", "name_ar": "رجُل الإطفاء",
+        "img": "https://upload.wikimedia.org/wikipedia/commons/thumb/7/76/Firefighter_icon.svg/512px-Firefighter_icon.svg.png",
+        "fact_en": "They put out fires and keep everyone safe.",
+        "fact_ar": "يطفئون الحرائق ويحفظون سلامة الجميع.",
+    },
+    {
+        "name_en": "Astronaut", "name_ar": "رائد الفضاء",
+        "img": "https://upload.wikimedia.org/wikipedia/commons/thumb/5/58/Astronaut_simple.svg/512px-Astronaut_simple.svg.png",
+        "fact_en": "They explore space and study the stars.",
+        "fact_ar": "يستكشفون الفضاء ويدرسون النجوم.",
+    },
+    {
+        "name_en": "Engineer", "name_ar": "المهندس",
+        "img": "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5e/Engineer_icon.svg/512px-Engineer_icon.svg.png",
+        "fact_en": "They design and build useful things.",
+        "fact_ar": "يصمّمون ويَبنون أشياء مفيدة.",
+    },
+]
+def random_hero_card():
+    h = random.choice(KID_HEROES)
+    title = h["name_ar"] if is_ar() else h["name_en"]
+    fact  = h["fact_ar"] if is_ar() else h["fact_en"]
+    st.markdown(tr("**Today's little hero**","**بطلنا الصغير اليوم**"))
+    cols = st.columns([1,2])
+    with cols[0]:
+        st.image(h["img"], use_container_width=True)
+    with cols[1]:
+        st.markdown(f"### {title}")
+        st.caption(fact)
+
+def render_name_extras(name: str):
+    if not name.strip():
+        return
+    m = lookup_name_meaning_local(name)
+    if not m:
+        m = lookup_name_meaning_ai(name)
+    st.info(tr(f"**Name meaning:** {m}", f"**معنى الاسم:** {m}"))
+    random_hero_card()
+
+# ------------------------------------------------------------------------------
+# Gemini/OpenAI wrapper
+# ------------------------------------------------------------------------------
+def ask_gemini(prompt: str) -> str:
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    out = model.generate_content(prompt)
+    return (getattr(out, "text", "").strip() or "").strip()
+
+def ask_simple(question: str, system: str = "") -> str:
+    # Gemini first
+    try:
+        return ask_gemini((system + "\n\n" if system else "") + question)
+    except Exception:
+        pass
+    # OpenAI fallback
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=([{"role":"system","content":system}] if system else []) + \
+                         [{"role":"user","content":question}],
+                temperature=0.4, max_tokens=220
             )
             return (resp.choices[0].message.content or "").strip()
         except Exception as e:
-            return tr(f"Sorry, I couldn't answer right now: {e}", f"عذراً، لا أستطيع الإجابة الآن: {e}")
-    return tr("Sorry, I couldn't answer right now.", "عذراً، لا أستطيع الإجابة الآن.")
+            return tr(f"Sorry, I couldn't answer: {e}", f"عذراً، لا أستطيع الإجابة: {e}")
+    return tr("Sorry, I couldn't answer right now.","عذراً، لا أستطيع الإجابة الآن.")
 
-# ===== Audio input UI
+# ------------------------------------------------------------------------------
+# Embeddings model (cached)
+# ------------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def load_embed_model():
+    return SentenceTransformer("distiluse-base-multilingual-cased-v1")
+
+# ------------------------------------------------------------------------------
+# PDF extraction (text + OCR)
+# ------------------------------------------------------------------------------
+def extract_text_pymupdf(pdf_bytes: bytes) -> str:
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        parts = []
+        for p in doc:
+            t = p.get_text("text")
+            if t and t.strip():
+                parts.append(t)
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+def extract_text_pdfminer(pdf_bytes: bytes) -> str:
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(pdf_bytes); tmp.flush()
+            txt = pdfminer_extract(tmp.name) or ""
+        os.unlink(tmp.name)
+        return txt
+    except Exception:
+        return ""
+
+def extract_text_ocr(pdf_bytes: bytes) -> str:
+    if not OCR_OK:
+        return ""
+    try:
+        poppler_path = os.getenv("POPPLER_PATH")  # optional
+        pages = convert_from_bytes(pdf_bytes, poppler_path=poppler_path) if poppler_path else convert_from_bytes(pdf_bytes)
+        lang = "ara+eng" if is_ar() else "eng"
+        pieces = []
+        for img in pages[:40]:  # safety cap
+            pieces.append(pytesseract.image_to_string(img, lang=lang))
+        return "\n".join(pieces)
+    except Exception:
+        return ""
+
+def extract_text_any(pdf_bytes: bytes) -> tuple[str, bool]:
+    # return (text, used_ocr)
+    txt = extract_text_pymupdf(pdf_bytes)
+    if len(txt.strip()) >= 50:
+        return txt, False
+    txt = extract_text_pdfminer(pdf_bytes)
+    if len(txt.strip()) >= 50:
+        return txt, False
+    txt = extract_text_ocr(pdf_bytes)
+    return txt, True
+
+# ------------------------------------------------------------------------------
+# Book Store: chunking, indexing, search
+# ------------------------------------------------------------------------------
+def chunk_text(text: str, chunk_size=900, overlap=150):
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks, i = [], 0
+    while i < len(text):
+        chunks.append(text[i:i+chunk_size])
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+def save_json(path: Path, data: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_json(path: Path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def build_book_index(raw_text: str, title: str) -> dict:
+    model = load_embed_model()
+    chunks = chunk_text(raw_text)
+    if not chunks:
+        return {"title": title, "chunks": [], "embeddings_path": None}
+    embs = model.encode(chunks, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
+    # store npy to disk
+    book_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", title) + "_" + str(int(datetime.utcnow().timestamp()))
+    book_dir = BOOKS_DIR / book_id
+    book_dir.mkdir(parents=True, exist_ok=True)
+    npy_path = book_dir / "embeddings.npy"
+    np.save(npy_path, embs)
+    meta = {"title": title, "chunks": chunks, "embeddings_path": str(npy_path)}
+    save_json(book_dir / "meta.json", meta)
+    return {"book_id": book_id, **meta}
+
+def list_books():
+    books = []
+    for p in BOOKS_DIR.iterdir():
+        if p.is_dir() and (p / "meta.json").exists():
+            meta = load_json(p / "meta.json", {})
+            meta["book_id"] = p.name
+            books.append(meta)
+    books.sort(key=lambda x: x.get("title",""))
+    return books
+
+def delete_book(book_id: str):
+    d = BOOKS_DIR / book_id
+    if d.exists():
+        shutil.rmtree(d, ignore_errors=True)
+
+def load_book(book_id: str) -> dict | None:
+    d = BOOKS_DIR / book_id
+    if (d / "meta.json").exists():
+        meta = load_json(d / "meta.json", {})
+        meta["book_id"] = book_id
+        return meta
+    return None
+
+def search_book(book_meta: dict, query: str, top_k=4) -> list[str]:
+    if not book_meta or not book_meta.get("chunks"):
+        return []
+    npy = book_meta.get("embeddings_path")
+    if not npy or not os.path.exists(npy):
+        return []
+    embs = np.load(npy)
+    model = load_embed_model()
+    q = model.encode([query], normalize_embeddings=True)
+    sims = cosine_similarity(q, embs)[0]
+    idxs = sims.argsort()[::-1][:top_k]
+    return [book_meta["chunks"][i] for i in idxs]
+
+# ------------------------------------------------------------------------------
+# Ask with book-first fallback
+# ------------------------------------------------------------------------------
+def ask_with_book_first(question: str, age: int | None) -> str:
+    # 1) if we have active book
+    active_id = st.session_state.get("active_book_id")
+    book_meta = load_book(active_id) if active_id else None
+    if book_meta:
+        ctx = "\n\n".join(search_book(book_meta, question, top_k=4))
+        if ctx.strip():
+            prompt = (
+                f"Use the following book excerpts to answer the kid's question.\n\n"
+                f"EXCERPTS:\n{ctx}\n\n"
+                f"QUESTION: {question}\n\n"
+                f"RULES: {_lang_hint()} Keep it short and kind. If unsure, say you aren't sure."
+            )
+            ans = ask_simple(prompt)
+            if ans and not re.search(r"not sure|غير متأكد|لا أعلم", ans, re.I):
+                return ans
+    # 2) fallback to general AI
+    system = f"You're a kind teacher for a child age {age or tr('kid','طفل')}. {_lang_hint()}"
+    return ask_simple(question, system)
+
+# ------------------------------------------------------------------------------
+# Onboarding (name -> age) with number chips and meaning/hero
+# ------------------------------------------------------------------------------
+def name_step():
+    st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
+    st.subheader(tr("🧩 What's your name?","🧩 ما اسمك؟"))
+
+    current_name = st.session_state.get("kid_name", "")
+    typed = st.text_input(tr("Type your name here:","اكتب اسمك هنا:"), value=current_name, key="kid_name_input")
+    if typed != current_name:
+        st.session_state["kid_name"] = typed
+
+    name = (st.session_state.get("kid_name","") or "").strip()
+    st.caption(tr("Preview","معاينة"))
+    st.markdown(bubble_name_html(name), unsafe_allow_html=True)
+
+    if name:
+        render_name_extras(name)
+
+    cols = st.columns([1,1,2])
+    if cols[1].button(tr("🎲 Random name","🎲 اسم عشوائي")):
+        demo = random.choice(["Maya","Omar","Lina","Adam","Sara","Ziad"])
+        st.session_state["kid_name"] = demo
+        st.rerun()
+    if cols[0].button(tr("👋 I'm ready!","👋 أنا جاهز!")):
+        final_name = name or tr("Kid","طفل")
+        st.session_state["child_name"] = final_name
+        st.balloons()
+        try:
+            greet = tr("Hi, {name}!","مرحباً يا {name}!").format(name=final_name)
+            st.session_state["name_greeting_bytes"] = tts_gtts_bytes(greet, lang=get_lang())
+            st.session_state["play_name_greeting"] = True
+        except Exception:
+            st.session_state["name_greeting_bytes"] = b""
+            st.session_state["play_name_greeting"] = False
+        st.session_state["onboarding_step"] = "age"
+        st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def age_step():
+    st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
+    st.subheader(tr("🎂 How old are you?","🎂 كم عمرك؟"))
+    st.caption(tr("Tap one","اختر عمرك"))
+
+    row = st.columns(10)
+    picked = None
+    for i, n in enumerate(range(1,11)):
+        with row[i]:
+            label = number_chip(n)  # colorful number badge
+            if st.button(label, key=f"age_btn_{n}"):
+                picked = n
+            st.markdown(f"<div style='text-align:center;opacity:.7'>{n}</div>", unsafe_allow_html=True)
+    if picked is not None:
+        st.session_state["kid_age"] = picked
+        st.session_state["onboarding_step"] = "ask"
+        st.rerun()
+
+    name = st.session_state.get("child_name", tr("Kid","طفل"))
+    st.markdown(f"<div class='wave'>{tr('Hi,','مرحباً،')} {html.escape(name)}!</div>", unsafe_allow_html=True)
+
+    if st.session_state.pop("play_name_greeting", False):
+        audio_bytes = st.session_state.pop("name_greeting_bytes", b"")
+        if audio_bytes:
+            st.audio(audio_bytes, format="audio/mp3")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ------------------------------------------------------------------------------
+# Ask page
+# ------------------------------------------------------------------------------
 def audio_input_ui():
     if HAS_AUDIO_RECORDER:
-        st.caption(tr("🎙️ Record your question", "🎙️ سجّل سؤالك"))
+        st.caption(tr("🎙️ Record your question","🎙️ سجّل سؤالك"))
         try:
             audio_bytes = audio_recorder(pause_threshold=1.0, sample_rate=16000,
                                          text=tr("Tap to record / stop","اضغط للتسجيل/إيقاف"))
@@ -271,668 +619,224 @@ def audio_input_ui():
             audio_bytes = None
         return audio_bytes, "recorder"
     st.caption(tr("📁 Upload a short WAV clip","📁 ارفع ملف WAV قصير"))
-    file = st.file_uploader(tr("Choose a .wav file","اختر ملف .wav"), type=["wav"],
-                            accept_multiple_files=False, label_visibility="collapsed")
-    return (file.read(), "upload") if file else (None, "upload")
+    f = st.file_uploader(tr("Choose .wav","اختر .wav"), type=["wav"], label_visibility="collapsed")
+    return (f.read() if f else None), "upload"
 
-# ===== Name bubbles
-BUBBLE_COLORS = [
-    ("#a7f3d0", "#86efac"), ("#93c5fd", "#bfdbfe"), ("#fbcfe8", "#fda4af"),
-    ("#fde68a", "#fca5a5"), ("#c7d2fe", "#93c5fd"), ("#fdba74", "#fef3c7"),
-]
-def bubble_name_html(name: str) -> str:
-    if not name.strip(): return "<div class='name-bubbles'> </div>"
-    spans = []
-    for i, ch in enumerate(name.strip()):
-        c1, c2 = random.choice(BUBBLE_COLORS)
-        delay = f"{0.05*i:.2f}s"
-        spans.append(f"<span class='bubble' style='--c1:{c1};--c2:{c2};--d:{delay}'>{html.escape(ch.upper())}</span>")
-    return "<div class='name-bubbles'>" + "".join(spans) + "</div>"
-
-# ===== Arabic-friendly extraction + embeddings
-ARABIC_DIACRITICS = re.compile(r"[\u0610-\u061A\u064B-\u065F\u06D6-\u06ED]")
-def normalize_arabic(s: str) -> str:
-    s = ARABIC_DIACRITICS.sub("", s)
-    s = s.replace("ـ", "")
-    s = re.sub("[إأآا]", "ا", s).replace("ى","ي").replace("ئ","ي").replace("ؤ","و").replace("ة","ه")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def extract_text_pymupdf_blocks(pdf_bytes: bytes) -> str:
-    try:
-        import fitz
-    except Exception:
-        return ""
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        pages = []
-        for p in doc:
-            blocks = p.get_text("blocks")
-            blocks.sort(key=lambda b: (round(b[1],1), round(b[0],1)))
-            page = [ (b[4] or "").strip() for b in blocks if (b[4] or "").strip() ]
-            pages.append("\n".join(page))
-        return "\n\n".join(pages)
-    except Exception:
-        return ""
-
-def extract_text_pdfminer(pdf_bytes: bytes) -> str:
-    try:
-        from pdfminer.high_level import extract_text
-    except Exception:
-        return ""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(pdf_bytes); tmp.flush()
-            return extract_text(tmp.name) or ""
-    except Exception:
-        return ""
-
-def ocr_with_ocrmypdf_then_extract(pdf_bytes: bytes) -> str:
-    try:
-        import subprocess, fitz
-    except Exception:
-        return ""
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as src:
-            src.write(pdf_bytes); src.flush()
-            dst = src.name.replace(".pdf", ".ocr.pdf")
-        cmd = ["ocrmypdf", "--force-ocr", "--deskew", "--clean", "--ocr-image-dpi", "300", "--optimize", "1", src.name, dst]
-        subprocess.run(cmd, check=True, capture_output=True)
-        doc = fitz.open(dst)
-        return "\n".join((p.get_text("text") or "") for p in doc)
-    except Exception:
-        return ""
-
-def ocr_pdf_images(pdf_bytes: bytes, lang: str="ar") -> str:
-    try:
-        import pytesseract
-        from pdf2image import convert_from_bytes
-        from PIL import Image, ImageOps, ImageFilter
-    except Exception:
-        return ""
-    tess_lang = "ara+eng" if lang.startswith("ar") else "eng"
-    poppler_path = os.getenv("POPPLER_PATH", None)
-    pages = convert_from_bytes(pdf_bytes, dpi=400, poppler_path=poppler_path) \
-            if poppler_path else convert_from_bytes(pdf_bytes, dpi=400)
-    out = []
-    for img in pages:
-        g = ImageOps.grayscale(img)
-        g = ImageOps.autocontrast(g)
-        g = g.filter(ImageFilter.UnsharpMask(radius=1.2, percent=150, threshold=3))
-        cfg = "--oem 3 --psm 6 -c preserve_interword_spaces=1"
-        out.append(pytesseract.image_to_string(g, lang=tess_lang, config=cfg))
-    return "\n".join(out)
-
-def robust_extract_text(pdf_bytes: bytes, lang: str="ar") -> Tuple[str, str]:
-    t1 = extract_text_pymupdf_blocks(pdf_bytes)
-    if len(normalize_arabic(t1)) > 120: return t1, "pymupdf-blocks"
-    t2 = extract_text_pdfminer(pdf_bytes)
-    if len(normalize_arabic(t2)) > 120: return t2, "pdfminer"
-    t3 = ocr_with_ocrmypdf_then_extract(pdf_bytes)
-    if len(normalize_arabic(t3)) > 120: return t3, "ocrmypdf"
-    t4 = ocr_pdf_images(pdf_bytes, lang=lang)
-    return t4, "pytesseract"
-
-def chunk_text(text: str, chunk_chars: int = 1200, overlap: int = 250) -> List[str]:
-    text = re.sub(r"\s+", " ", text).strip()
-    chunks, i = [], 0
-    while i < len(text):
-        end = min(len(text), i + chunk_chars)
-        cut = text[i:end]
-        dot = max(cut.rfind("۔"), cut.rfind("."))
-        if dot >= 0 and end - (i + dot) < 300:
-            end = i + dot + 1
-        chunks.append(text[i:end])
-        i = max(end - overlap, i + 1)
-    return chunks
-
-class LocalBookIndex:
-    def __init__(self):
-        self.model = None
-        self.index = None
-        self.chunks = []
-
-    def _load_model(self):
-        if self.model is None:
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-
-    def build(self, raw_text: str):
-        self._load_model()
-        self.chunks = chunk_text(raw_text)
-        texts = [normalize_arabic(c) for c in self.chunks]
-        embs = self.model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        import faiss
-        d = embs.shape[1]
-        self.index = faiss.IndexFlatIP(d)
-        self.index.add(embs.astype("float32"))
-
-    def search_text(self, query: str, top_k: int = 6) -> str:
-        if self.index is None: return ""
-        self._load_model()
-        import faiss
-        qv = self.model.encode([normalize_arabic(query)], normalize_embeddings=True).astype("float32")
-        D, I = self.index.search(qv, top_k)
-        parts = []
-        for idx in I[0]:
-            if idx >= 0: parts.append(self.chunks[int(idx)])
-        return "\n\n".join(parts)
-
-# ===== Book store persistence
-def list_books() -> list[dict]:
-    items = []
-    for fn in sorted(os.listdir(BOOK_DIR)):
-        if fn.endswith(".json"):
-            try:
-                data = json.load(open(os.path.join(BOOK_DIR, fn), "r", encoding="utf-8"))
-                items.append(data)
-            except Exception:
-                pass
-    return items
-
-def save_book(name: str, text: str, method: str):
-    sid = slugify(name)
-    path = os.path.join(BOOK_DIR, f"{sid}.json")
-    data = {
-        "id": sid,
-        "name": name,
-        "method": method,
-        "created": datetime.datetime.utcnow().isoformat()+"Z",
-        "text": text
-    }
-    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-
-def delete_book(sid: str):
-    path = os.path.join(BOOK_DIR, f"{sid}.json")
-    if os.path.exists(path):
-        os.remove(path)
-
-def load_book_text(sid: str) -> str:
-    path = os.path.join(BOOK_DIR, f"{sid}.json")
-    if not os.path.exists(path): return ""
-    try:
-        data = json.load(open(path, "r", encoding="utf-8"))
-        return data.get("text","")
-    except Exception:
-        return ""
-
-# ===== Book-first QA for Ask tab
-def answer_kid_question_with_book_first(question: str, category: str | None, age: int | None) -> str:
-    passages = ""
-    book_ix = st.session_state.get("book_index")
-    if book_ix is not None:
-        try:
-            passages = book_ix.search_text(question, top_k=6)
-        except Exception:
-            passages = ""
-    if passages.strip():
-        prompt = (
-            f"Use the following book excerpts to answer a child's question.\n\n"
-            f"EXCERPTS:\n{passages}\n\n"
-            f"QUESTION: {question}\n\n"
-            f"RULES: {_lang_hint()} Keep it short, clear, and fun. "
-            f"If the answer isn’t in the excerpts, say you aren’t sure."
-        )
-        try:
-            ans = ask_gemini(prompt).strip()
-            if ans: return ans
-        except Exception:
-            pass
-        if client:
-            try:
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role":"user","content":prompt}],
-                    temperature=0.4, max_tokens=220
-                )
-                ans = (resp.choices[0].message.content or "").strip()
-                if ans: return ans
-            except Exception:
-                pass
-    return ask_with_context(question, category, age)
-
-# ===== Onboarding
-def name_step():
-    st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
-    st.subheader(tr("🧩 What's your name?", "🧩 ما اسمك؟"))
-    current_name = st.session_state.get("kid_name", "")
-    typed = st.text_input(tr("Type your name here:","اكتب اسمك هنا:"), value=current_name)
-    if typed != current_name: st.session_state["kid_name"] = typed
-    name = (st.session_state.get("kid_name","") or "").strip()
-    st.caption(tr("Preview","معاينة"))
-    st.markdown(bubble_name_html(name), unsafe_allow_html=True)
-    cols = st.columns([1,1,2])
-    if cols[1].button(tr("🎲 Random name","🎲 اسم عشوائي")):
-        st.session_state["kid_name"] = random.choice(["Maya","Omar","Lina","Adam","Sara","Ziad"]); st.rerun()
-    if cols[0].button(tr("👋 I'm ready!","👋 أنا جاهز!")):
-        final_name = name or tr("Kid","طفل")
-        st.session_state["child_name"] = final_name
-        st.session_state["onboarding_step"] = "age"
-        st.balloons(); st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-
-def _age_chip(n: int):
-    g1, g2 = random.choice(ALPHA_COLORS)
-    st.markdown(f"<div class='age-chip' style='--g1:{g1};--g2:{g2}'>{n}</div>", unsafe_allow_html=True)
-
-def age_step():
-    st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
-    st.subheader(tr("🎂 How old are you?","🎂 كم عمرك؟"))
-    st.caption(tr("Tap one","اختر عمرك"))
-    row = st.columns(10); picked = None
-    for i, n in enumerate(range(1,11)):
-        with row[i]:
-            _age_chip(n)
-            if st.button(str(n), key=f"age_{n}"): picked = n
-    if picked is not None:
-        st.session_state["kid_age"] = picked
-        st.session_state["onboarding_step"] = "ask"
-        st.rerun()
-    st.markdown("</div>", unsafe_allow_html=True)
-
-def render_category_picker():
-    st.markdown(tr("#### 🎒 Pick a topic","#### 🎒 اختر موضوعاً"))
-    keys = list(CATEGORIES.keys())
-    for start in range(0, len(keys), 4):
-        row_keys = keys[start:start+4]
-        cols = st.columns(len(row_keys))
-        for i, k in enumerate(row_keys):
-            cfg = CATEGORIES[k]
-            with cols[i]:
-                st.markdown(
-                    f"<div style=\"background:linear-gradient(135deg,{cfg['colors'][0]},{cfg['colors'][1]});"
-                    f"padding:14px;border-radius:16px;color:#0b1324;font-weight:900;"
-                    f"box-shadow:0 10px 22px rgba(0,0,0,.08);text-align:center\">"
-                    f"<div style='font-size:36px'>{cfg['emoji']}</div>"
-                    f"<div style='font-size:18px;margin-top:4px'>{k}</div></div>",
-                    unsafe_allow_html=True
-                )
-                if st.button((tr("Choose","اختر") + f" {k}"), key=f"choose_{k}"):
-                    st.session_state["topic_category"] = k; st.rerun()
-
-def render_idea_chips(category: str):
-    ideas = CATEGORIES.get(category, {}).get("ideas", [])
-    if not ideas: return
-    st.markdown(tr("##### Try one of these:","##### جرّب أحد هذه الأسئلة:"))
-    chip_cols = st.columns(min(6, len(ideas)))
-    for i, idea in enumerate(ideas):
-        with chip_cols[i % len(chip_cols)]:
-            if st.button(idea, key=f"idea_{category}_{i}"):
-                st.session_state["child_question"] = idea; st.rerun()
-
-def _explain_three_ways(base_q: str, base_a: str, age: int | None, category: str | None):
-    if "explain3" in st.session_state and st.session_state.get("explain3_q") == base_q:
-        return st.session_state["explain3"]
-    age_text = f"{age}" if age else tr("kid","طفل")
-    topic = category or "General"
-    def _gen(prompt: str) -> str:
-        try:
-            return ask_gemini(prompt).strip()
-        except Exception:
-            pass
-        if client:
-            try:
-                resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role":"user","content":prompt}],
-                    temperature=0.5, max_tokens=220
-                )
-                return (resp.choices[0].message.content or "").strip()
-            except Exception:
-                return ""
-        return ""
+def explain_three(question: str, answer: str, age: int | None):
     lang_line = _lang_hint()
-    picture = _gen((f"Explain with a visual description for a child age {age_text} ({topic}). "
-                    f"Describe a simple picture for this answer: {base_a}. 2–3 cheerful sentences. {lang_line}"))
-    story = _gen((f"Tell a short cute story (<=80 words) for age {age_text} that teaches this answer: {base_a}. {lang_line}"))
-    steps = _gen((f"Explain in 3–5 very short lines for age {age_text} to understand the idea behind: {base_a}. "
-                  f"Return each step on a new line, no numbering. {lang_line}"))
-    st.session_state["explain3"] = {"picture": picture, "story": story, "steps": steps}
-    st.session_state["explain3_q"] = base_q
-    return st.session_state["explain3"]
+    def _g(p):
+        try:
+            return ask_gemini(p).strip()
+        except Exception:
+            return ask_simple(p)
+    picture = _g(
+        f"Explain with a visual description for a child age {age or tr('kid','طفل')} to understand: {answer}. "
+        f"2–3 cheerful sentences. {lang_line}"
+    )
+    story = _g(
+        f"Tell a short cute story (<=80 words) teaching the idea: {answer}. "
+        f"Use simple words. {lang_line}"
+    )
+    steps = _g(
+        f"Explain in 3–5 very short steps to understand: {answer}. "
+        f"Return each step on a new line, no numbering. {lang_line}"
+    )
+    return {"picture": picture, "story": story, "steps": steps}
 
-def ask_step():
+def render_ask():
     st.markdown("<div class='kids-ui'>", unsafe_allow_html=True)
+    st.title(tr("👨‍👧 Ask DAD AI","👨‍👧 اسأل بابا الذكي"))
+    step = st.session_state.get("onboarding_step", "name")
+    if step == "name":
+        name_step(); st.markdown("</div>", unsafe_allow_html=True); return
+    if step == "age":
+        age_step(); st.markdown("</div>", unsafe_allow_html=True); return
+
     name = st.session_state.get("child_name", tr("Kid","طفل"))
-    age = st.session_state.get("kid_age")
-    category = st.session_state.get("topic_category")
-    st.markdown(tr("### 👋 Hello,","### 👋 أهلاً،") + f" **{name}**" + (f" — age {age}" if age else ""))
-    if not category:
-        render_category_picker()
-    else:
-        cfg = CATEGORIES[category]
-        st.markdown(
-            f"<div style='background:linear-gradient(135deg,{cfg['colors'][0]},{cfg['colors'][1]});"
-            f"border-radius:14px;padding:10px 14px;color:#0b1324;font-weight:900;margin:6px 0;'>"
-            f"{cfg['emoji']} {tr('Topic:','الموضوع:')} {category}</div>", unsafe_allow_html=True
-        )
-        c1, c2, c3 = st.columns([1,1,1])
-        with c1:
-            if st.button(tr("🔄 Change topic","🔄 تغيير الموضوع")):
-                st.session_state.pop("topic_category", None); st.rerun()
-        with c2:
-            if st.button(tr("🎯 More ideas","🎯 اقتراحات أخرى")):
-                random.shuffle(CATEGORIES[category]["ideas"]); st.rerun()
-        with c3:
-            if st.button(tr("✨ Surprise me","✨ فاجئني")):
-                rand_cat = random.choice(list(CATEGORIES.keys()))
-                st.session_state["topic_category"] = rand_cat
-                st.session_state["prefill_child_question"] = random.choice(CATEGORIES[rand_cat]["ideas"])
-                st.rerun()
-        render_idea_chips(category)
-    default_q = st.session_state.pop("prefill_child_question", None)
-    question = st.text_input(tr("❓ What do you want to ask?","❓ ما الذي تريد سؤاله؟"),
-                             value=(default_q or ""), key="ask_input")
-    audio_bytes, _ = audio_input_ui()
+    age  = st.session_state.get("kid_age")
+
+    q = st.text_input(tr("❓ What do you want to ask?","❓ ما الذي تريد سؤاله؟"), key="ask_q")
+    audio_bytes, _src = audio_input_ui()
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
         with st.spinner(tr("Transcribing…","جاري التفريغ الصوتي…")):
             text, err = transcribe_audio(audio_bytes)
         if text:
-            st.session_state['prefill_child_question'] = text
+            st.session_state["ask_q"] = text
             st.success(tr("✅ Added your question above.","✅ أضفنا سؤالك في الأعلى.")); st.rerun()
         else:
-            st.error(tr("🛑 Couldn't transcribe your audio.","🛑 تعذّر تفريغ الصوت.")); 
+            st.error(tr("🛑 Couldn't transcribe your audio.","🛑 تعذّر تفريغ الصوت."))
             if err: st.caption(err)
-    c1, c2, c3 = st.columns([1,1,1])
+
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button(tr("✨ Get Answer","✨ احصل على الإجابة"), use_container_width=True):
-            if not question.strip():
+        if st.button(tr("✨ Get Answer","✨ احصل على الإجابة")):
+            if not q.strip():
                 st.info(tr("Please type a question or use the mic/uploader.","من فضلك اكتب سؤالاً أو استخدم الميكروفون/الرفع."))
             else:
-                answer = answer_kid_question_with_book_first(question.strip(), category, age)
-                st.session_state["last_answer"] = answer
-                st.session_state["last_question"] = question.strip()
-                st.session_state["just_answered"] = True; st.rerun()
+                ans = ask_with_book_first(q, age)
+                st.session_state["last_q"] = q
+                st.session_state["last_a"] = ans
+                st.rerun()
     with c2:
-        if st.button(tr("🔊 Read Aloud","🔊 قراءة بصوت عالٍ"), use_container_width=True):
-            ans = st.session_state.get("last_answer","")
-            if ans: st.audio(tts_gtts_bytes(ans, lang=get_lang()), format="audio/mp3")
-            else: st.info(tr("Ask something first!","اسأل شيئاً أولاً!"))
+        if st.button(tr("🔊 Read Aloud","🔊 قراءة بصوت عالٍ")):
+            a = st.session_state.get("last_a","")
+            if a:
+                try:
+                    st.audio(tts_gtts_bytes(a, lang=get_lang()), format="audio/mp3")
+                except Exception as e:
+                    st.error(f"TTS error: {e}")
+            else:
+                st.info(tr("Ask something first!","اسأل شيئاً أولاً!"))
     with c3:
-        if st.button(tr("🔁 Ask another","🔁 سؤال آخر"), use_container_width=True):
-            st.session_state.pop("last_answer", None); st.session_state.pop("last_question", None); st.rerun()
-    if st.session_state.get("last_answer"):
-        if st.session_state.pop("just_answered", False):
-            st.balloons()
+        if st.button(tr("🔁 Ask another","🔁 سؤال آخر")):
+            for k in ["last_q","last_a"]: st.session_state.pop(k, None)
+            st.rerun()
+
+    if st.session_state.get("last_a"):
         st.markdown(tr("#### 🌟 Answer","#### 🌟 الإجابة"))
-        st.success(st.session_state["last_answer"])
-        st.markdown(tr("#### Explain 3 Ways","#### اشرح بثلاث طرق"))
+        st.success(st.session_state["last_a"])
+        e3 = explain_three(st.session_state.get("last_q",""), st.session_state["last_a"], age)
         tabs = st.tabs([tr("🖼 Picture","🖼 صورة"), tr("📖 Story","📖 قصة"), tr("🪜 Steps","🪜 خطوات")])
-        e3 = _explain_three_ways(st.session_state.get("last_question",""),
-                                 st.session_state["last_answer"], age, category)
         with tabs[0]:
-            st.write(e3.get("picture",""))
+            st.write(e3["picture"])
         with tabs[1]:
-            st.write(e3.get("story",""))
+            st.write(e3["story"])
         with tabs[2]:
-            render_alpha_steps(e3.get("steps",""))
+            render_alpha_steps(e3["steps"])
+
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ===== NEON quick chat
-NEON_CSS = """
-<style>
-:root{ --neon:#3DF0A5; --neon2:#5BB9FF; --bg:#020617; --glass: rgba(15,23,42,.55); --txt:#E6F1FF; --dim:#90A4B4; }
-.neon-bg{ position:relative; background:radial-gradient(ellipse at top,#0b1b33 0%,#020617 60%); padding:8px; border-radius:24px; }
-.neon-header{ display:flex; align-items:center; gap:10px; padding:10px 16px; border-radius:16px;
-  background:linear-gradient(90deg, rgba(61,240,165,.18), rgba(91,185,255,.18)); color:var(--txt); font-weight:900; }
-.neon-window{ margin-top:10px; border-radius:26px; padding:16px; min-height:360px; color:var(--txt); }
-.msg{max-width:80%; padding:10px 14px; border-radius:14px; margin:8px 0; display:inline-block}
-.msg.user{background:rgba(91,185,255,.18)}
-.msg.bot{background:rgba(61,240,165,.16)}
-.row{display:flex;gap:8px} .right{justify-content:flex-end}
-</style>
-"""
-def render_neon_chat_ui():
-    st.markdown(NEON_CSS, unsafe_allow_html=True)
-    if "neon_chat" not in st.session_state: st.session_state.neon_chat = []
-    st.markdown('<div class="neon-bg">', unsafe_allow_html=True)
-    st.markdown('<div class="neon-header">🤖 Ask DAD AI</div>', unsafe_allow_html=True)
-    st.markdown('<div class="neon-window">', unsafe_allow_html=True)
-    for role, text in st.session_state.neon_chat[-12:]:
-        cls = "right" if role=="user" else ""
-        who = "user" if role=="user" else "bot"
-        st.markdown(f'<div class="row {cls}"><div class="msg {who}">{html.escape(text)}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-    q = st.text_input(" ", key="child_question", label_visibility="collapsed",
-                      placeholder=tr("Type your question…","اكتب سؤالك…"))
-    if st.button("➤", key="neon_send"):
-        if q.strip():
-            st.session_state.neon_chat.append(("user", q.strip()))
-            ans = answer_kid_question_with_book_first(q.strip(), st.session_state.get("topic_category"), st.session_state.get("kid_age"))
-            st.session_state.neon_chat.append(("bot", ans))
-            st.session_state["child_question"] = ""; st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# ===== BOOK STORE tab (persistent)
-def render_book_store_tab():
-    st.subheader(tr("📚 Your Book Shelf", "📚 مكتبة كتبك"))
-    # Upload & store
-    with st.expander(tr("➕ Add a new book","➕ إضافة كتاب جديد"), expanded=False):
-        name = st.text_input(tr("Book title (for your shelf)","اسم الكتاب (للمكتبة)"), key="store_title")
-        file = st.file_uploader(tr("Upload PDF","ارفع PDF"), type=["pdf"], key="store_pdf")
-        if st.button(tr("Scan & Save","فحص وحفظ"), key="store_save"):
-            if not name.strip() or not file:
-                st.warning(tr("Please provide a title and a PDF.","يرجى إدخال عنوان وملف PDF."))
-            else:
-                with st.spinner(tr("Extracting and saving…","جاري الاستخراج والحفظ…")):
-                    pdf_bytes = file.read()
-                    txt, method = robust_extract_text(pdf_bytes, get_lang())
-                    if len(normalize_arabic(txt)) < 200:
-                        st.error(tr("Couldn't extract enough text.","تعذّر استخراج نص كافٍ."))
-                    else:
-                        save_book(name.strip(), txt, method)
-                        st.success(tr("Saved to your shelf.","تم الحفظ في المكتبة.")); st.rerun()
-
-    # List books
-    books = list_books()
-    if not books:
-        st.info(tr("No books yet. Add one above.","لا توجد كتب بعد. أضف كتاباً أعلاه."))
-        return
-
-    for b in books:
-        with st.container(border=True):
-            c1, c2, c3, c4 = st.columns([5,1,1,1])
-            with c1:
-                st.markdown(f"**{b.get('name','(no name)')}**")
-                st.caption(tr(f"Method: {b.get('method','?')} • Added: {b.get('created','?')}",
-                              f"الطريقة: {b.get('method','?')} • الإضافة: {b.get('created','?')}"))
-            with c2:
-                if st.button(tr("Use","استخدام"), key=f"use_{b['id']}"):
-                    txt = b.get("text","")
-                    st.session_state["book_index"] = LocalBookIndex()
-                    st.session_state["book_index"].build(txt)
-                    st.session_state["active_book_name"] = b.get("name","")
-                    st.success(tr(f"Active book: {b.get('name','')}",
-                                  f"الكتاب المُفعل: {b.get('name','')}"))
-            with c3:
-                if st.button(tr("Preview","معاينة"), key=f"prev_{b['id']}"):
-                    st.session_state["preview_book_id"] = b["id"]
-            with c4:
-                if st.button(tr("Delete","حذف"), key=f"del_{b['id']}"):
-                    delete_book(b["id"]); st.rerun()
-
-            # small preview
-            if st.session_state.get("preview_book_id") == b["id"]:
-                chunks = chunk_text(b.get("text",""))
-                st.text_area(tr("First pages (chunks)","أول الصفحات (مقاطع)"),
-                             "\n\n".join(chunks[:2]), height=220)
-                st.session_state["preview_book_id"] = None
-
-    # Show active
-    if st.session_state.get("active_book_name"):
-        st.success(tr(f"Active book: {st.session_state['active_book_name']}",
-                      f"الكتاب المُفعل: {st.session_state['active_book_name']}"))
-
-# ===== Learning Book (temporary)
-def render_learning_book_tab_local():
-    st.write(tr("Upload a PDF book (English or Arabic). We'll search it first before using AI.",
-               "ارفع كتاب PDF (عربي أو إنجليزي). سنبحث فيه أولاً قبل استخدام الذكاء الاصطناعي."))
-    file = st.file_uploader(tr("Choose a PDF", "اختر ملف PDF"), type=["pdf"])
-    if file is not None:
+# ------------------------------------------------------------------------------
+# Learning Book (quick PDF QA, not stored)
+# ------------------------------------------------------------------------------
+def render_learning_book():
+    st.title(tr("📚 Learning Book","📚 كتاب التعلم"))
+    f = st.file_uploader(tr("Choose a PDF","اختر ملف PDF"), type=["pdf"])
+    if f is not None:
         with st.spinner(tr("Extracting text…","جاري استخراج النص…")):
-            pdf_bytes = file.read()
-            txt, method = robust_extract_text(pdf_bytes, get_lang())
-        if len(normalize_arabic(txt)) < 200:
-            st.warning(tr("I couldn't read enough text. If it is scanned, try a clearer copy.",
-                          "تعذّر استخراج نص كافٍ. إذا كان ممسوحاً ضوئياً، جرّب نسخة أوضح."))
+            pdf_bytes = f.read()
+            txt, used_ocr = extract_text_any(pdf_bytes)
+        if len(txt.strip()) < 40:
+            if used_ocr and not OCR_OK:
+                st.warning(tr(
+                    "I couldn't read enough text. Your PDF looks scanned. Install tesseract-ocr + poppler.",
+                    "لم أستطع قراءة نص كافٍ. يبدو أن الملف ممسوح ضوئياً (نحتاج tesseract-ocr + poppler)."
+                ))
+            else:
+                st.warning(tr("Couldn't extract much text from this PDF.","تعذّر استخراج نص كافٍ."))
         else:
-            st.success(tr(f"Book loaded using: {method}", f"تم تحميل الكتاب بطريقة: {method}"))
+            st.success(tr("Book loaded! Ask a question below.","تم تحميل الكتاب! اسأل سؤالك أدناه."))
             st.session_state["learning_book_text"] = txt
-            st.session_state["book_index"] = LocalBookIndex()
-            st.session_state["book_index"].build(txt)
-            st.session_state["active_book_name"] = file.name
 
-    book_text = st.session_state.get("learning_book_text","")
-    if book_text:
+    txt = st.session_state.get("learning_book_text","")
+    if txt:
         q = st.text_input(tr("Ask about the book:","اسأل عن الكتاب:"))
         if st.button(tr("🔎 Answer from book","🔎 أجب من الكتاب")):
-            if not q.strip():
-                ans = tr("Please type a question.","من فضلك اكتب سؤالاً.")
-            else:
-                passages = st.session_state["book_index"].search_text(q, top_k=6)
-                if passages.strip():
-                    prompt = (f"Use these passages to answer the child's question.\n\n"
-                              f"{passages}\n\nQ: {q}\n\n{_lang_hint()} Keep it short and friendly.")
-                    try:
-                        ans = ask_gemini(prompt)
-                    except Exception:
-                        if client:
-                            resp = client.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[{"role":"user","content":prompt}],
-                                temperature=0.4, max_tokens=220
-                            )
-                            ans = (resp.choices[0].message.content or "").strip()
-                        else:
-                            ans = tr("Sorry, I couldn't answer right now.", "عذراً، لا أستطيع الإجابة الآن.")
-                else:
-                    ans = tr("I'm not sure. The text seems unrelated or too short.",
-                             "لست متأكداً. يبدو أن النص غير متعلق أو قصير جداً.")
+            chunks = chunk_text(txt)
+            # lightweight char-ngrams search without model
+            try:
+                from sklearn.feature_extraction.text import TfidfVectorizer
+                vect = TfidfVectorizer(analyzer="char", ngram_range=(3,5))
+                X = vect.fit_transform(chunks + [q])
+                sims = cosine_similarity(X[-1], X[:-1]).flatten()
+                top = [chunks[i] for i in sims.argsort()[::-1][:4]]
+                ctx = "\n\n".join(top)
+            except Exception:
+                ctx = chunks[0][:1000] if chunks else ""
+            prompt = f"Use this text to answer the kid shortly.\n\n{ctx}\n\nQ: {q}\n\n{_lang_hint()}"
+            ans = ask_simple(prompt)
             st.markdown(tr("#### Answer","#### الإجابة"))
             st.success(ans)
-            if st.button(tr("🔊 Read Aloud","🔊 قراءة بصوت عالٍ")):
-                st.audio(tts_gtts_bytes(ans, lang=get_lang()), format="audio/mp3")
 
-# ========================= MAIN
-if tab == tr("💬 Ask DAD AI", "💬 اسأل بابا الذكي"):
-    st.title(tr("👨‍👧 Ask DAD AI","👨‍👧 اسأل بابا الذكي"))
-    step = st.session_state.get("onboarding_step", "name")
-    if step == "name":
-        name_step()
-    elif step == "age":
-        age_step()
-    else:
-        if "child_name" not in st.session_state:
-            st.session_state["child_name"] = (st.session_state.get("kid_name","") or tr("Kid","طفل")).strip()
-        if ui_style == "Neon":
-            render_neon_chat_ui()
-        else:
-            ask_step()
+# ------------------------------------------------------------------------------
+# Book Store (upload/store/manage + choose active book)
+# ------------------------------------------------------------------------------
+def render_book_store():
+    st.title(tr("📚 Book Store","📚 مخزن الكتب"))
+    st.caption(tr("Upload Arabic/English PDFs. We'll index & store them so kids' questions use the active book first.",
+                  "ارفع ملفات PDF (عربي/إنجليزي). سنفهرسها ونستخدم الكتاب النشط للإجابة أولاً."))
 
-elif tab == tr("🏪 Book Store", "🏪 مكتبة الكتب"):
-    st.title(tr("🏪 Book Store","🏪 مكتبة الكتب"))
-    render_book_store_tab()
-
-elif tab == tr("📚 Learning Book", "📚 كتاب التعلم"):
-    st.title(tr("📚 Learning Book","📚 كتاب التعلم"))
-    render_learning_book_tab_local()
-
-elif tab == tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"):
-    st.title(tr("🐾 Animal Fun", "🐾 مرح مع الحيوانات"))
-    st.write(tr("Type an animal name to play a sound, or generate a fun drawing!",
-               "اكتب اسم حيوان لتشغيل صوته أو توليد رسمة لطيفة!"))
-    col1, col2 = st.columns(2)
-    with col1:
-        animal = st.text_input(tr("Animal name (e.g., cat, dog, lion)","اسم الحيوان (مثلاً: قط، كلب، أسد)"))
-        if st.button(tr("🔊 Play Animal Sound","🔊 شغّل صوت الحيوان")):
-            if animal.strip(): play_animal_sound(animal.strip().lower())
-            else: st.info(tr("Please enter an animal name.","أدخل اسم الحيوان."))
-    with col2:
-        prompt = st.text_input(tr("Describe a drawing you want","صف رسمة تريدها"))
-        if st.button(tr("🎨 Generate Cute Drawing (Stability)","🎨 أنشئ رسمة لطيفة (Stability)")):
-            img_bytes = generate_drawing_with_stability(prompt)
-            if img_bytes: st.image(img_bytes, caption=tr("Generated Art","صورة مولّدة"), use_column_width=True)
-            else: st.warning(tr("Couldn't generate drawing (check STABILITY_API_KEY).",
-                               "تعذّر توليد الرسمة (تحقق من STABILITY_API_KEY)."))
-
-elif tab == tr("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"):
-    st.title(tr("🛠️ Dad's Dashboard", "🛠️ لوحة تحكم الأب"))
-    if st.button(tr("📧 Send Test Email to Dad","📧 أرسل رسالة تجريبية للأب")):
-        ok, msg = send_email_to_dad(tr("Test Kid","طفل اختبار"),
-                                    tr("This is a test email.","هذه رسالة تجريبية."),
-                                    tr("This is a test answer.","هذه إجابة تجريبية."))
-        if ok: st.success(tr("Test email sent ✅","تم إرسال الرسالة ✅")); st.caption(msg)
-        else: st.error(tr("Test email failed ❌","فشل الإرسال ❌")); st.code(msg, language="text")
-    render_dashboard_tab()
-
-elif tab == tr("🧠 Quiz Fun", "🧠 مسابقة ممتعة"):
-    st.title(tr("🧠 Quiz Fun","🧠 مسابقة ممتعة"))
-    st.write(tr("Answer fun questions and get stars!","أجب عن أسئلة ممتعة واحصل على نجوم!"))
-    name = st.text_input(tr("Your name for the scoreboard:","اسمك في لوحة النتائج:"), key="quiz_name")
-    if "quiz_started" not in st.session_state: st.session_state.quiz_started = False
-    if "quiz_score" not in st.session_state: st.session_state.quiz_score = 0
-    if "quiz_q_index" not in st.session_state: st.session_state.quiz_q_index = 0
-    if not st.session_state.quiz_started:
-        if st.button(tr("▶️ Start Quiz","▶️ ابدأ المسابقة")):
-            st.session_state.quiz_started = True; st.rerun()
-    else:
-        q = get_quiz_question(st.session_state.quiz_q_index)
-        if q is None:
-            st.subheader(tr("🏁 Finished! Your score:","🏁 انتهيت! نتيجتك:") + f" {st.session_state.quiz_score}/5")
-            stars = "⭐"*st.session_state.quiz_score + "☆"*(5 - st.session_state.quiz_score)
-            st.markdown(f"### {stars}"); play_win_sound()
-            if name.strip(): log_score(name.strip(), st.session_state.quiz_score)
-            if st.button(tr("🔁 Play Again","🔁 العب مجدداً")):
-                for k in list(st.session_state.keys()):
-                    if k.startswith("quiz_"): del st.session_state[k]
-                st.rerun()
-        else:
-            st.subheader(q["question"])
-            labeled = [f"{chr(65+i)}. {opt}" for i, opt in enumerate(q["choices"])]
-            choice = st.radio(tr("Pick one:","اختر واحدة:"), labeled, key=f"quiz_choice_{st.session_state.quiz_q_index}")
-            if st.button(tr("✅ Submit","✅ أرسل")):
-                idx = labeled.index(choice)
-                if q["choices"][idx] == q["answer"]:
-                    st.success(tr("Correct! 🎉","صحيح! 🎉")); play_correct_sound(); st.session_state.quiz_score += 1
+    # Upload
+    f = st.file_uploader(tr("Upload a PDF to store","ارفع ملف PDF للتخزين"), type=["pdf"])
+    if f is not None:
+        with st.spinner(tr("Reading & indexing…","جاري القراءة والفهرسة…")):
+            pdf_bytes = f.read()
+            txt, used_ocr = extract_text_any(pdf_bytes)
+            if len(txt.strip()) >= 40:
+                info = build_book_index(txt, f.name)
+                st.success(tr("Book stored and indexed!","تم تخزين الكتاب وفهرسته!"))
+            else:
+                if used_ocr and not OCR_OK:
+                    st.error(tr("Looks scanned; OCR not available on server.","الملف ممسوح ضوئياً، و OCR غير متاح على الخادم."))
                 else:
-                    st.error(tr("Oops! Correct answer is:","الجواب الصحيح:") + f" {q['answer']}"); play_wrong_sound()
-                st.session_state.quiz_q_index += 1; st.rerun()
+                    st.error(tr("Couldn't extract useful text.","تعذّر استخراج نص مفيد."))
 
-elif tab == tr("📊 Scoreboard", "📊 لوحة النتائج"):
-    st.title(tr("📊 Quiz Scoreboard","📊 لوحة النتائج"))
-    show_scoreboard()
+    # List + choose active + delete
+    books = list_books()
+    if not books:
+        st.info(tr("No books stored yet.","لا توجد كتب بعد."))
+        return
 
-elif tab == tr("🎨 Draw & Guess (Gemini)", "🎨 ارسم وخمّن (Gemini)"):
-    st.title(tr("🎨 Draw & Guess (Gemini)","🎨 ارسم وخمّن (Gemini)"))
-    stroke_w = st.slider(tr("Pen size","حجم القلم"), 4, 30, 12)
-    bg = st.color_picker(tr("Background","الخلفية"), "#FFFFFF")
-    st.write(tr("Tip: use black pen on white background for best results.",
-               "نصيحة: استخدم قلماً أسود وخلفية بيضاء لنتائج أفضل."))
-    canvas_result = st_canvas(fill_color="rgba(0, 0, 0, 0)", stroke_width=stroke_w, stroke_color="#000000",
-                              background_color=bg, update_streamlit=True, height=300, width=300,
-                              drawing_mode="freedraw", key="canvas")
-    col1, col2 = st.columns(2); guess = None
-    if col1.button(tr("🤖 Guess with Gemini","🤖 تخمين باستخدام Gemini")):
-        if canvas_result.image_data is not None:
-            from PIL import Image
-            img = Image.fromarray(canvas_result.image_data.astype("uint8"), "RGBA")
-            img = img.convert("L").point(lambda x: 0 if x < 250 else 255).convert("RGB")
-            buf = BytesIO(); img.save(buf, format="PNG"); png_bytes = buf.getvalue()
-            with st.spinner(tr("Asking Gemini...","سؤال Gemini...")):
-                try:
-                    guess = classify_sketch(png_bytes)
-                except Exception as e:
-                    st.error(f"Gemini error: {e}"); guess = None
-        else:
-            st.info(tr("Please draw something first.","من فضلك ارسم شيئاً أولاً."))
-    if guess:
-        st.success(tr(
-            f"I think it's a **{guess.get('animal','unknown')}** (certainty {guess.get('certainty',0):.2f})",
-            f"أعتقد أنها **{guess.get('animal','غير معروف')}** (درجة الثقة {guess.get('certainty',0):.2f})"
-        ))
-        if guess.get("alternatives"): st.caption(tr("Other ideas: ","أفكار أخرى: ") + ", ".join(guess["alternatives"]))
-        if col2.button(tr("📷 Show real photo","📷 عرض صورة حقيقية")):
-            url = fetch_animal_photo(guess.get("animal",""))
-            if url: st.image(url, caption=tr("Real photo","صورة حقيقية"), use_column_width=True)
-            else: st.warning(tr("Couldn't find a photo right now.","تعذّر العثور على صورة الآن."))
+    active = st.session_state.get("active_book_id")
+    for meta in books:
+        with st.expander(meta["title"], expanded=False):
+            book_id = meta["book_id"]
+            npy = meta.get("embeddings_path")
+            st.write(tr("Chunks","القطع النصية"), len(meta.get("chunks", [])))
+            st.write(tr("Embeddings path","مسار المتجهات:"), npy)
+            col1, col2 = st.columns([1,1])
+            with col1:
+                if st.button(tr("Use","استخدم"), key=f"use_{book_id}"):
+                    st.session_state["active_book_id"] = book_id
+                    st.success(tr(f"Active book: {meta['title']}", f"الكتاب النشط: {meta['title']}"))
+            with col2:
+                if st.button(tr("Delete","حذف"), key=f"del_{book_id}"):
+                    if active == book_id:
+                        st.session_state.pop("active_book_id", None)
+                    delete_book(book_id)
+                    st.rerun()
+
+    if st.session_state.get("active_book_id"):
+        meta = load_book(st.session_state["active_book_id"])
+        if meta:
+            st.success(tr(f"Active book: {meta['title']}", f"الكتاب النشط: {meta['title']}"))
+
+# ------------------------------------------------------------------------------
+# Placeholders for other tabs (you can wire your own modules here)
+# ------------------------------------------------------------------------------
+def render_animal_fun():
+    st.title(tr("🐾 Animal Fun","🐾 مرح مع الحيوانات"))
+    animal = st.text_input(tr("Animal name (e.g., cat, dog, lion)","اسم الحيوان (مثلاً: قط، كلب، أسد)"))
+    if st.button(tr("🔊 Play Animal Sound","🔊 شغّل صوت الحيوان")):
+        st.info(tr(f"Pretend we're playing the sound of {animal} 🐾","سنُشغّل صوت الحيوان افتراضياً 🐾"))
+
+def render_quiz():
+    st.title(tr("🧠 Quiz Fun","🧠 مسابقة ممتعة"))
+    st.info(tr("Wire your quiz here.","اربط مسابقتك هنا."))
+
+def render_scoreboard():
+    st.title(tr("📊 Scoreboard","📊 لوحة النتائج"))
+    st.info(tr("Show your saved scores here.","اعرض نتائجك هنا."))
+
+def render_draw_guess():
+    st.title(tr("🎨 Draw & Guess","🎨 ارسم وخمّن"))
+    st.info(tr("Plug your drawable canvas game here.","أضف لعبة الرسم هنا."))
+
+# ------------------------------------------------------------------------------
+# Router
+# ------------------------------------------------------------------------------
+if tab == tr("💬 Ask DAD AI","💬 اسأل بابا الذكي"):
+    render_ask()
+elif tab == tr("📚 Learning Book","📚 كتاب التعلم"):
+    render_learning_book()
+elif tab == tr("📚 Book Store (choose & manage)","📚 مخزن الكتب (اختيار وإدارة)"):
+    render_book_store()
+elif tab == tr("🐾 Animal Fun","🐾 مرح مع الحيوانات"):
+    render_animal_fun()
+elif tab == tr("🧠 Quiz Fun","🧠 مسابقة ممتعة"):
+    render_quiz()
+elif tab == tr("📊 Scoreboard","📊 النتائج"):
+    render_scoreboard()
+elif tab == tr("🎨 Draw & Guess","🎨 ارسم وخمّن"):
+    render_draw_guess()
